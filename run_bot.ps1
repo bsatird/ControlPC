@@ -38,7 +38,7 @@ if (!(Test-Path $CamReg)) { New-Item -Path $CamReg -Force | Out-Null }
 Set-ItemProperty -Path $CamReg -Name "Value" -Value "Allow"
 
 Write-Host "[*] Перевірка та встановлення бібліотек Python (зачекайте)..." -ForegroundColor Cyan
-$packages = "pyTelegramBotAPI", "opencv-python", "pyautogui", "psutil", "pyttsx3", "sounddevice", "scipy", "pyperclip"
+$packages = "pyTelegramBotAPI", "opencv-python", "pyautogui", "psutil", "pyttsx3", "sounddevice", "scipy", "pyperclip", "pillow"
 foreach ($pkg in $packages) {
     python -m pip install $pkg --quiet
 }
