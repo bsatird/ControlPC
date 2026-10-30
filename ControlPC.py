@@ -30,8 +30,8 @@ time.sleep(15)
 MY_ID = "7678008217" # Твій ID
 PC_NAME = platform.node()
 
-# --- ВЕРСІЯ 2.8 (АВТОМАТИЧНЕ ВСТАНОВЛЕННЯ ДОДАТКІВ) ---
-BOT_VERSION = "2.8 (Автоматичне встановлення додатків)"
+# --- ВЕРСІЯ 2.9 (ПЕРЕЗАПУСК БОТА + ОНОВЛЕННЯ З GITHUB) ---
+BOT_VERSION = "2.9 (Перезапуск бота та оновлення з GitHub)"
 
 # Папка бота за дефолтом
 botDir = os.path.join(os.environ.get('LOCALAPPDATA', ''), 'ControlPC')
@@ -72,6 +72,7 @@ def get_system_menu():
     markup.row("📝 Процеси", "📸 Фото з камери")
     markup.row("📋 Буфер обміну", "🖥 Дистанційне керування")
     markup.row("📥 Встановити додаток")
+    markup.row("🔄 Перезапустити бота")
     markup.row("❌ Вимкнути ПК", "🔄 Перезавантажити")
     markup.add("🔙 Головне меню")
     return markup
@@ -899,6 +900,17 @@ def handle_text(message):
     elif msg == "🔄 Перезавантажити":
         bot.send_message(MY_ID, "Перезавантажую...")
         os.system("shutdown /r /t 5")
+
+    # --- ПЕРЕЗАПУСК БОТА (ОНОВЛЕННЯ З GITHUB) ---
+    elif msg == "🔄 Перезапустити бота":
+        try:
+            bot.send_message(MY_ID, "🔄 Перезапуск бота та оновлення з GitHub...")
+        except Exception:
+            pass
+        time.sleep(1)   # коротка пауза, щоб повідомлення гарантовано дійшло до Telegram
+        # sys.exit() у потоці-обробнику вбиває лише сам потік, тому жорстко завершуємо ВЕСЬ процес:
+        # скрипт start_internal.bat (run_bot.ps1) підхопить це, перекачає файл з GitHub і запустить нову версію
+        os._exit(0)
 
 if __name__ == "__main__":
     while True:
