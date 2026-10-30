@@ -1,16 +1,27 @@
 # -*- coding: utf-8 -*-
-"""ControlPC Mini App - серверна частина (Етап 1: фундамент).
+"""ControlPC Mini App - серверна частина (Етапи 1-3).
 
 Легкий HTTP-сервер на стандартній бібліотеці Python (без нових залежностей, щоб
 не зламати вже налаштовані ноутбуки). Запускається у фоновому потоці з ControlPC.py
 і віддає:
-    /            - інтерфейс Mini App (miniapp/index.html)
-    /style.css   - стилі Mini App
-    /app.js      - логіка Mini App
-    /api/health  - перевірка, що сервер живий (без секретів)
-    /api/auth    - POST {"initData": "..."} -> перевірка підпису Telegram + сесія
-    /api/me      - користувач, для якого видано сесію
-    /api/status  - системний знімок ПК (тільки читання, для дашборду)
+    /                     - інтерфейс Mini App (miniapp/index.html)
+    /style.css            - стилі Mini App
+    /app.js               - логіка Mini App
+    /api/health           - перевірка, що сервер живий (без секретів)
+    /api/auth             - POST {"initData": "..."} -> перевірка підпису Telegram + сесія
+    /api/me               - користувач, для якого видано сесію
+    /api/status           - системний знімок ПК (тільки читання, для дашборду)
+    /api/actions          - які дії керування доступні на цьому ПК
+    /api/processes        - список процесів (PID, RAM, стан, чи можна завершити)
+    /api/camera/snapshot  - знімок з веб-камери (JPEG у пам'яті)
+    /api/power            - POST живлення: shutdown / reboot / sleep / lock / cancel
+    /api/process/kill     - POST завершення процесу за PID (у два кроки)
+    /api/media            - POST гучність, мут, медіа-клавіші
+
+Критичні дії (живлення, завершення процесу) виконуються у два кроки: спочатку
+сервер видає одноразовий токен підтвердження (живе CONFIRM_TTL секунд і прив'язаний
+до дії та користувача), і лише запит із цим токеном реально щось змінює. Так
+випадковий тап по кнопці не може вимкнути ПК.
 
 Безпека (обов'язкова для Telegram Mini Apps):
     * initData перевіряється HMAC-SHA256 з ключем HMAC("WebAppData", bot_token)
@@ -26,12 +37,15 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import importlib.util
 import json
 import mimetypes
 import os
 import platform
 import re
 import secrets
+import subprocess
+import sys
 import threading
 import time
 import urllib.parse
@@ -43,7 +57,7 @@ try:
 except ImportError:  # psutil є у боті, але модуль має працювати й без нього
     psutil = None  # type: ignore
 
-API_VERSION = "1.0"
+API_VERSION = "1.1"
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8777
 DEFAULT_INIT_DATA_TTL = 24 * 3600      # скільки живе initData з Telegram
@@ -51,6 +65,12 @@ DEFAULT_SESSION_TTL = 12 * 3600        # скільки живе сесія Mini
 MAX_BODY_BYTES = 16 * 1024             # максимальний розмір JSON-запиту
 AUTH_FAIL_LIMIT = 10                   # скільки невдалих спроб з однієї адреси
 AUTH_FAIL_WINDOW = 60                  # ... за стільки секунд блокуємо (429)
+CONFIRM_TTL = 45                       # скільки діє підтвердження критичної дії, сек
+POWER_DELAY_MIN = 5                    # мінімальна затримка вимкнення, сек
+POWER_DELAY_MAX = 300                  # максимальна затримка вимкнення, сек
+CAMERA_MIN_INTERVAL = 2.0              # пауза між знімками з камери, сек
+CAMERA_QUALITY = 82                    # якість JPEG зі камери
+PROCESS_LIST_LIMIT = 60                # скільки процесів максимум віддаємо
 
 # Статичні файли Mini App: тільки ці типи віддаємо назовні
 STATIC_EXTENSIONS = {".html", ".css", ".js", ".svg", ".png", ".ico", ".webmanifest"}
@@ -514,6 +534,430 @@ def system_snapshot(bot_version: str = "", pc_name: str = "") -> Dict[str, Any]:
     return snapshot
 
 
+# ==========================================
+# ДІЇ КЕРУВАННЯ ПК (ЕТАП 3)
+# ==========================================
+# Усе, що змінює стан ПК, зібрано тут. Кожна функція повертає словник формату
+# {"ok": bool, ...} і ніколи не кидає виняток назовні - помилка дії не повинна
+# ламати ні HTTP-сервер, ні бота.
+POWER_ACTIONS = ("shutdown", "reboot", "sleep", "lock")
+POWER_LABELS = {
+    "shutdown": "Вимкнення ПК",
+    "reboot": "Перезавантаження",
+    "sleep": "Режим сну",
+    "lock": "Блокування екрана",
+}
+
+MEDIA_KEYS = {
+    "volume_up": 0xAF,      # VK_VOLUME_UP
+    "volume_down": 0xAE,    # VK_VOLUME_DOWN
+    "mute": 0xAD,           # VK_VOLUME_MUTE
+    "play_pause": 0xB3,     # VK_MEDIA_PLAY_PAUSE
+    "next": 0xB0,           # VK_MEDIA_NEXT_TRACK
+    "prev": 0xB1,           # VK_MEDIA_PREV_TRACK
+    "stop": 0xB2,           # VK_MEDIA_STOP
+}
+
+MEDIA_LABELS = {
+    "volume_up": "Гучність збільшено",
+    "volume_down": "Гучність зменшено",
+    "mute": "Звук перемкнуто",
+    "play_pause": "Плей / пауза",
+    "next": "Наступний трек",
+    "prev": "Попередній трек",
+    "stop": "Стоп",
+}
+
+# Процеси, які не можна завершувати навіть із підтвердженням: без них Windows
+# падає або перезавантажується (bsod / втрата сесії).
+PROTECTED_PROCESSES = {
+    "system", "system idle process", "registry", "memory compression", "memcompression",
+    "secure system", "smss.exe", "csrss.exe", "wininit.exe", "winlogon.exe", "services.exe",
+    "lsass.exe", "svchost.exe", "fontdrvhost.exe", "dwm.exe", "audiodg.exe", "sihost.exe",
+}
+
+# Батьківські процеси, через які запущений бот: їх завершення = вбити бота.
+BOT_HOST_PROCESSES = {
+    "python.exe", "pythonw.exe", "py.exe", "pyw.exe",
+    "cmd.exe", "conhost.exe", "wscript.exe", "cscript.exe", "powershell.exe", "pwsh.exe",
+}
+
+_CAMERA_LOCK = threading.Lock()
+_CAMERA_LAST = [0.0]
+
+
+class ConfirmStore:
+    """Одноразові токени підтвердження критичних дій.
+
+    Токен прив'язаний до дії ("power:shutdown", "kill:4242") і до Telegram ID.
+    Живе CONFIRM_TTL секунд і знімається при першому використанні, тому повторний
+    запит із тим самим токеном уже не пройде.
+    """
+
+    def __init__(self, ttl: int = CONFIRM_TTL):
+        self.ttl = int(ttl)
+        self._items: Dict[str, Dict[str, Any]] = {}
+        self._lock = threading.Lock()
+
+    def issue(self, action: str, user_id: int) -> Dict[str, Any]:
+        token = secrets.token_urlsafe(24)
+        with self._lock:
+            self._prune()
+            self._items[token] = {"action": action,
+                                  "user_id": int(user_id),
+                                  "expires": _now() + self.ttl}
+        return {"token": token, "expires_in": self.ttl}
+
+    def consume(self, token: str, action: str, user_id: int) -> bool:
+        if not token:
+            return False
+        with self._lock:
+            item = self._items.pop(token, None)
+        if not item or item["expires"] < _now():
+            return False
+        return item["action"] == action and item["user_id"] == int(user_id)
+
+    def _prune(self) -> None:
+        """Прибирає прострочені токени (викликається під замком)."""
+        moment = _now()
+        for key in [k for k, v in self._items.items() if v["expires"] < moment]:
+            self._items.pop(key, None)
+
+
+def _is_windows() -> bool:
+    return os.name == "nt"
+
+
+def clamp_delay(value: Any, default: int = 15) -> int:
+    """Затримка вимкнення: ціле число в межах POWER_DELAY_MIN..POWER_DELAY_MAX."""
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        number = default
+    return max(POWER_DELAY_MIN, min(POWER_DELAY_MAX, number))
+
+
+def power_confirm_text(action: str, delay: int = 0) -> str:
+    """Текст попередження для підтвердження дії живлення."""
+    if action == "shutdown":
+        return f"ПК вимкнеться через {delay} с. Незбережені дані можуть втратитися."
+    if action == "reboot":
+        return f"ПК перезавантажиться через {delay} с. Бот підніметься сам після старту."
+    if action == "sleep":
+        return "ПК перейде в режим сну. Розбудити його віддалено не вийде."
+    return POWER_LABELS.get(action, "Дія з живленням")
+
+
+def power_cancel() -> Dict[str, Any]:
+    """Скасовує заплановане вимкнення/перезавантаження (shutdown /a)."""
+    if not _is_windows():
+        return {"ok": False, "error": "Керування живленням доступне лише на Windows",
+                "reason": "platform"}
+    try:
+        proc = subprocess.run(["shutdown", "/a"], capture_output=True, text=True, timeout=15)
+    except Exception as e:
+        return {"ok": False, "error": f"Не вдалося скасувати: {e}", "reason": "exec"}
+    if proc.returncode != 0:
+        return {"ok": False, "error": "Немає запланованого вимкнення",
+                "details": (proc.stderr or proc.stdout or "").strip(), "reason": "nothing"}
+    return {"ok": True, "action": "cancel", "text": "Заплановане вимкнення скасовано"}
+
+
+def power_execute(action: str, delay: int = 15) -> Dict[str, Any]:
+    """Виконує дію живлення. Windows-only, без винятків назовні."""
+    action = str(action or "").strip().lower()
+    if action not in POWER_ACTIONS:
+        return {"ok": False, "error": "Невідома дія живлення", "reason": "bad_action"}
+    if not _is_windows():
+        return {"ok": False, "error": "Керування живленням доступне лише на Windows",
+                "reason": "platform"}
+
+    if action == "lock":
+        try:
+            import ctypes
+            if not ctypes.windll.user32.LockWorkStation():
+                return {"ok": False, "error": "Windows відмовився блокувати екран",
+                        "reason": "exec"}
+        except Exception as e:
+            return {"ok": False, "error": f"Не вдалося заблокувати екран: {e}",
+                    "reason": "exec"}
+        return {"ok": True, "action": "lock", "delay": 0, "text": "Екран заблоковано"}
+
+    if action == "sleep":
+        try:
+            import ctypes
+            # SetSuspendState(Hibernate=0, ForceCritical=1, DisableWakeEvent=0).
+            # Якщо в системі вимкнена гібернація - це звичайний сон.
+            ctypes.windll.powrprof.SetSuspendState(0, 1, 0)
+        except Exception as e:
+            return {"ok": False, "error": f"Не вдалося перевести ПК в сон: {e}",
+                    "reason": "exec"}
+        return {"ok": True, "action": "sleep", "delay": 0, "text": "ПК переходить у сон"}
+
+    delay = clamp_delay(delay)
+    comment = f"ControlPC Mini App: {POWER_LABELS.get(action, action)}"
+    args = ["shutdown", "/s" if action == "shutdown" else "/r", "/t", str(delay), "/c", comment]
+    try:
+        proc = subprocess.run(args, capture_output=True, text=True, timeout=20)
+    except Exception as e:
+        return {"ok": False, "error": f"Команда не запустилася: {e}", "reason": "exec"}
+    if proc.returncode != 0:
+        details = (proc.stderr or proc.stdout or "").strip()
+        return {"ok": False, "error": details or "Windows відмовився виконувати команду",
+                "reason": "exec"}
+
+    text = (f"ПК вимкнеться через {delay} с" if action == "shutdown"
+            else f"ПК перезавантажиться через {delay} с")
+    return {"ok": True, "action": action, "delay": delay, "text": text}
+
+
+def _bot_tree_pids() -> set:
+    """PID бота та батьківських python/cmd/wscript - завершувати їх не можна."""
+    pids = {os.getpid()}
+    if psutil is None:
+        return pids
+    try:
+        current = psutil.Process()
+        for _ in range(8):
+            parent = current.parent()
+            if parent is None:
+                break
+            if (parent.name() or "").lower() not in BOT_HOST_PROCESSES:
+                break
+            pids.add(parent.pid)
+            current = parent
+    except Exception:
+        pass
+    return pids
+
+
+def _protected_reason(pid: int, name: str, bot_pids: set) -> str:
+    """Чому процес не можна завершувати (порожній рядок = можна)."""
+    lowered = (name or "").lower()
+    if pid in (0, 4) or lowered in PROTECTED_PROCESSES:
+        return "Критичний процес Windows"
+    if pid in bot_pids:
+        return "Процес бота ControlPC"
+    return ""
+
+
+def list_processes(limit: int = 40, query: str = "") -> List[Dict[str, Any]]:
+    """Активні процеси для панелі «Додатки»: ім'я, PID, RAM, стан, захист."""
+    if psutil is None:
+        return []
+    needle = (query or "").strip().lower()
+    bot_pids = _bot_tree_pids()
+    items: List[Dict[str, Any]] = []
+    try:
+        iterator = psutil.process_iter(["pid", "name", "username", "memory_percent", "status"])
+    except Exception as e:
+        log(f"processes: {e}")
+        return []
+    for proc in iterator:
+        try:
+            info = proc.info
+            pid = int(info.get("pid") or 0)
+            name = info.get("name") or "?"
+            if needle and needle not in name.lower():
+                continue
+            reason = _protected_reason(pid, name, bot_pids)
+            items.append({
+                "pid": pid,
+                "name": name,
+                "memory_percent": round(float(info.get("memory_percent") or 0), 1),
+                "user": (info.get("username") or "").split("\\")[-1],
+                "status": (info.get("status") or "").lower(),
+                "protected": bool(reason),
+                "protected_reason": reason,
+            })
+        except (psutil.NoSuchProcess, psutil.AccessDenied, TypeError, ValueError):
+            continue
+    items.sort(key=lambda item: item["memory_percent"], reverse=True)
+    return items[:max(1, int(limit or 40))]
+
+
+def kill_prepare(pid: Any) -> Dict[str, Any]:
+    """Перевіряє, чи можна завершити процес, і віддає дані для підтвердження."""
+    if psutil is None:
+        return {"ok": False, "error": "psutil недоступний на цьому ПК", "reason": "psutil"}
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return {"ok": False, "error": "Некоректний PID", "reason": "bad_pid"}
+    if pid <= 0:
+        return {"ok": False, "error": "Некоректний PID", "reason": "bad_pid"}
+    try:
+        proc = psutil.Process(pid)
+        name = proc.name() or "?"
+    except psutil.NoSuchProcess:
+        return {"ok": False, "error": "Процес уже не працює", "reason": "gone"}
+    except psutil.AccessDenied:
+        return {"ok": False, "error": "Немає доступу до цього процесу", "reason": "access"}
+    except Exception as e:
+        return {"ok": False, "error": f"Не вдалося прочитати процес: {e}", "reason": "error"}
+
+    reason = _protected_reason(pid, name, _bot_tree_pids())
+    if reason:
+        return {"ok": False, "pid": pid, "name": name, "reason": "protected",
+                "error": f"{reason} — завершення заблоковано"}
+    try:
+        memory = round(float(proc.memory_percent() or 0), 1)
+    except Exception:
+        memory = 0.0
+    return {"ok": True, "pid": pid, "name": name, "memory_percent": memory,
+            "text": f"Завершити «{name}» (PID {pid})?"}
+
+
+def kill_process(pid: Any) -> Dict[str, Any]:
+    """Завершує процес: terminate(), а якщо не відповів - kill()."""
+    check = kill_prepare(pid)
+    if not check.get("ok"):
+        return check
+    pid, name = check["pid"], check["name"]
+    started = _now()
+    try:
+        proc = psutil.Process(pid)
+        proc.terminate()
+    except psutil.NoSuchProcess:
+        return {"ok": False, "pid": pid, "name": name, "reason": "gone",
+                "error": "Процес уже завершився"}
+    except psutil.AccessDenied:
+        return {"ok": False, "pid": pid, "name": name, "reason": "access",
+                "error": "Немає прав — запусти бота від адміністратора"}
+    except Exception as e:
+        return {"ok": False, "pid": pid, "name": name, "reason": "error",
+                "error": f"Не вдалося завершити: {e}"}
+
+    forced = False
+    try:
+        proc.wait(timeout=2.0)
+    except psutil.TimeoutExpired:
+        try:
+            proc.kill()
+            forced = True
+            proc.wait(timeout=1.5)
+        except psutil.NoSuchProcess:
+            forced = True
+        except Exception as e:
+            return {"ok": False, "pid": pid, "name": name, "reason": "stuck",
+                    "error": f"Процес не завершився: {e}"}
+    except Exception:
+        pass
+
+    log(f"kill {name} (PID {pid}) -> {'forced' if forced else 'terminate'}")
+    return {"ok": True, "pid": pid, "name": name, "forced": forced,
+            "elapsed_ms": int((_now() - started) * 1000),
+            "text": f"«{name}» завершено" + (" (примусово)" if forced else "")}
+
+
+def camera_available() -> bool:
+    """Чи є на ПК модуль opencv (перевірка без важкого імпорту)."""
+    try:
+        return importlib.util.find_spec("cv2") is not None
+    except Exception:
+        return False
+
+
+def camera_snapshot(quality: int = CAMERA_QUALITY) -> Tuple[bytes, int, int]:
+    """Знімок з веб-камери у JPEG у пам'яті (файли не створюються).
+
+    Повертає (jpeg, ширина, висота) або кидає MiniAppError з людським текстом.
+    """
+    if not _CAMERA_LOCK.acquire(blocking=False):
+        raise MiniAppError("Камера вже зайнята іншим знімком — спробуй за мить")
+    try:
+        if _now() - _CAMERA_LAST[0] < CAMERA_MIN_INTERVAL:
+            raise MiniAppError("Зачекай кілька секунд перед наступним знімком")
+        try:
+            import cv2
+        except ImportError:
+            raise MiniAppError("Модуль opencv на ПК не встановлено")
+
+        cap = None
+        try:
+            try:
+                cap = cv2.VideoCapture(0, cv2.CAP_DSHOW if _is_windows() else 0)
+            except Exception:
+                cap = cv2.VideoCapture(0)
+            if cap is None or not cap.isOpened():
+                raise MiniAppError("Камера не знайдена або зайнята іншою програмою")
+            try:
+                cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+            except Exception:
+                pass
+            frame = None
+            for _ in range(4):          # перші кадри камери часто темні
+                ok, candidate = cap.read()
+                if ok and candidate is not None:
+                    frame = candidate
+                time.sleep(0.08)
+            if frame is None:
+                raise MiniAppError("Камера не віддала кадр")
+            ok_encode, buffer = cv2.imencode(".jpg", frame,
+                                             [cv2.IMWRITE_JPEG_QUALITY, int(quality)])
+            if not ok_encode:
+                raise MiniAppError("Не вдалося стиснути кадр у JPEG")
+            data = buffer.tobytes()
+            height, width = int(frame.shape[0]), int(frame.shape[1])
+            _CAMERA_LAST[0] = _now()
+            return data, width, height
+        finally:
+            if cap is not None:
+                try:
+                    cap.release()
+                except Exception:
+                    pass
+    finally:
+        _CAMERA_LOCK.release()
+
+
+def media_action(action: str, steps: int = 5) -> Dict[str, Any]:
+    """Гучність / мут / медіа-клавіші через keybd_event (без сторонніх бібліотек)."""
+    action = str(action or "").strip().lower()
+    if action not in MEDIA_KEYS:
+        return {"ok": False, "error": "Невідома медіа-дія", "reason": "bad_action"}
+    if not _is_windows():
+        return {"ok": False, "error": "Медіа-клавіші доступні лише на Windows",
+                "reason": "platform"}
+    try:
+        count = int(steps)
+    except (TypeError, ValueError):
+        count = 5
+    if action in ("volume_up", "volume_down"):
+        count = max(1, min(20, count))
+    else:
+        count = 1
+    try:
+        import ctypes
+        user32 = ctypes.windll.user32
+        vk = MEDIA_KEYS[action]
+        for _ in range(count):
+            user32.keybd_event(vk, 0, 0, 0)     # натиснути
+            user32.keybd_event(vk, 0, 2, 0)     # відпустити (KEYEVENTF_KEYUP)
+            if count > 1:
+                time.sleep(0.03)
+    except Exception as e:
+        return {"ok": False, "error": f"Не вдалося надіслати клавішу: {e}", "reason": "exec"}
+    return {"ok": True, "action": action, "steps": count,
+            "text": MEDIA_LABELS.get(action, "Виконано")}
+
+
+def capabilities() -> Dict[str, Any]:
+    """Що реально доступне на цьому ПК (Mini App вимикає зайві кнопки)."""
+    windows = _is_windows()
+    return {
+        "platform": f"{platform.system()} {platform.release()}",
+        "windows": windows,
+        "power": windows,
+        "media": windows,
+        "camera": camera_available(),
+        "processes": psutil is not None,
+        "power_delay": {"min": POWER_DELAY_MIN, "max": POWER_DELAY_MAX, "default": 15},
+        "limits": {"processes": PROCESS_LIST_LIMIT, "camera_interval": CAMERA_MIN_INTERVAL},
+    }
+
+
 _FALLBACK_HTML = """<!doctype html>
 <html lang="uk"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -528,13 +972,27 @@ code{background:#0e1621;padding:2px 6px;border-radius:6px}</style></head>
 <p>Перевірка API: <code>/api/health</code></p></body></html>"""
 
 
+class _QuietThreadingHTTPServer(ThreadingHTTPServer):
+    """ThreadingHTTPServer, який не засмічує лог бота мережевими обривами.
+
+    Mini App часто закривають посеред запиту (згорнули Telegram, зникло
+    з'єднання) - це нормальний ConnectionReset, а не помилка сервера.
+    """
+
+    def handle_error(self, request: Any, client_address: Any) -> None:
+        exc = sys.exc_info()[1]
+        if isinstance(exc, (ConnectionResetError, BrokenPipeError, ConnectionAbortedError)):
+            return
+        log(f"HTTP: {exc}")
+
+
 # ==========================================
 # HTTP-ОБРОБНИК MINI APP
 # ==========================================
 _CSP = ("default-src 'self'; "
         "script-src 'self' 'unsafe-inline' https://telegram.org; "
         "style-src 'self' 'unsafe-inline'; "
-        "img-src 'self' data:; "
+        "img-src 'self' data: blob:; "
         "connect-src 'self'; "
         "base-uri 'none'; frame-ancestors https://web.telegram.org https://*.telegram.org")
 
@@ -554,6 +1012,7 @@ class MiniAppHandler(BaseHTTPRequestHandler):
     allowed_origins: Tuple[str, ...] = ()
     sessions: SessionStore
     guard: AuthGuard
+    confirms: ConfirmStore
 
     # --- базове ---
     def log_message(self, fmt: str, *args: Any) -> None:
@@ -699,6 +1158,46 @@ class MiniAppHandler(BaseHTTPRequestHandler):
             self._json({"ok": True, "user_id": user_id, "server_time": int(_now())})
             return
 
+        if path == "/api/actions":
+            if not self._require_session():
+                return
+            self._json({"ok": True, "actions": capabilities(), "server_time": int(_now())})
+            return
+
+        if path == "/api/processes":
+            if not self._require_session():
+                return
+            if psutil is None:
+                self._error(503, "psutil недоступний на цьому ПК", "psutil")
+                return
+            query = urllib.parse.parse_qs(parsed.query)
+            try:
+                limit = int((query.get("limit") or [PROCESS_LIST_LIMIT])[0])
+            except (TypeError, ValueError):
+                limit = PROCESS_LIST_LIMIT
+            limit = max(1, min(PROCESS_LIST_LIMIT, limit))
+            needle = (query.get("q") or [""])[0][:60]
+            processes = list_processes(limit, needle)
+            self._json({"ok": True, "processes": processes, "count": len(processes),
+                        "server_time": int(_now())})
+            return
+
+        if path == "/api/camera/snapshot":
+            if not self._require_session():
+                return
+            try:
+                data, width, height = camera_snapshot()
+            except MiniAppError as e:
+                self._error(503, str(e), "camera")
+                return
+            except Exception as e:
+                log(f"camera: {e}")
+                self._error(500, "Не вдалося зробити знімок", "camera")
+                return
+            log(f"camera snapshot {width}x{height}, {len(data)} байт")
+            self._send(data, 200, "image/jpeg")
+            return
+
         if path.startswith("/api/"):
             self._error(404, "Невідомий метод API", "no_route")
             return
@@ -757,6 +1256,87 @@ class MiniAppHandler(BaseHTTPRequestHandler):
             self._json({"ok": True})
             return
 
+        if path == "/api/power":
+            user_id = self._require_session()
+            if not user_id:
+                return
+            payload = self._read_json()
+            if payload is None:
+                return
+            action = str(payload.get("action") or "").strip().lower()
+            if action == "cancel":
+                result = power_cancel()
+                log(f"power cancel -> {result.get('ok')}")
+                self._json(result, 200 if result.get("ok") else 409)
+                return
+            if action not in POWER_ACTIONS:
+                self._error(400, "Невідома дія живлення", "bad_action")
+                return
+            delay = clamp_delay(payload.get("delay"))
+            token = str(payload.get("confirm") or "")
+            needs_confirm = action in ("shutdown", "reboot", "sleep")
+            if needs_confirm and not token:
+                response: Dict[str, Any] = {
+                    "ok": True,
+                    "needs_confirm": True,
+                    "action": action,
+                    "delay": delay,
+                    "text": power_confirm_text(action, delay),
+                }
+                response.update(self.confirms.issue(f"power:{action}", user_id))
+                log(f"power {action}: чекає підтвердження від {user_id}")
+                self._json(response)
+                return
+            if needs_confirm and not self.confirms.consume(token, f"power:{action}", user_id):
+                self._error(409, "Підтвердження прострочене — повтори дію", "confirm")
+                return
+            result = power_execute(action, delay)
+            log(f"power {action} -> {result.get('ok')} {result.get('reason') or ''}".rstrip())
+            self._json(result, 200 if result.get("ok") else 500)
+            return
+
+        if path == "/api/process/kill":
+            user_id = self._require_session()
+            if not user_id:
+                return
+            payload = self._read_json()
+            if payload is None:
+                return
+            check = kill_prepare(payload.get("pid"))
+            if not check.get("ok"):
+                self._json(check, 403 if check.get("reason") == "access" else 400)
+                return
+            token = str(payload.get("confirm") or "")
+            if not token:
+                response = {
+                    "ok": True,
+                    "needs_confirm": True,
+                    "pid": check["pid"],
+                    "name": check["name"],
+                    "memory_percent": check.get("memory_percent", 0),
+                    "text": check.get("text", ""),
+                }
+                response.update(self.confirms.issue(f"kill:{check['pid']}", user_id))
+                self._json(response)
+                return
+            if not self.confirms.consume(token, f"kill:{check['pid']}", user_id):
+                self._error(409, "Підтвердження прострочене — онови список", "confirm")
+                return
+            result = kill_process(check["pid"])
+            self._json(result, 200 if result.get("ok") else 409)
+            return
+
+        if path == "/api/media":
+            if not self._require_session():
+                return
+            payload = self._read_json()
+            if payload is None:
+                return
+            result = media_action(str(payload.get("action") or ""), payload.get("steps", 5))
+            log(f"media {payload.get('action')} -> {result.get('ok')}")
+            self._json(result, 200 if result.get("ok") else 500)
+            return
+
         if path.startswith("/api/"):
             self._error(404, "Невідомий метод API", "no_route")
             return
@@ -787,6 +1367,7 @@ class MiniAppServer:
         self.pc_name = pc_name
         self.sessions = SessionStore(config.session_ttl)
         self.guard = AuthGuard()
+        self.confirms = ConfirmStore()
         self.error = ""
         self._httpd: Optional[ThreadingHTTPServer] = None
         self._thread: Optional[threading.Thread] = None
@@ -840,6 +1421,7 @@ class MiniAppServer:
             "allowed_origins": tuple(sorted(origins)),
             "sessions": self.sessions,
             "guard": self.guard,
+            "confirms": self.confirms,
         })
 
     # --- запуск / зупинка ---
@@ -856,7 +1438,8 @@ class MiniAppServer:
         last_error: Optional[Exception] = None
         for port in range(self.config.port, self.config.port + 5):
             try:
-                httpd = ThreadingHTTPServer((self.config.host, port), self._handler_class(port))
+                httpd = _QuietThreadingHTTPServer((self.config.host, port),
+                                                  self._handler_class(port))
             except OSError as e:
                 last_error = e
                 log(f"порт {port} недоступний: {e}")
