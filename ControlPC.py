@@ -5,6 +5,7 @@ import os
 import psutil
 import pyautogui
 import cv2 
+import numpy as np
 import ctypes
 import threading
 import webbrowser
@@ -30,8 +31,8 @@ time.sleep(15)
 MY_ID = "7678008217" # Твій ID
 PC_NAME = platform.node()
 
-# --- ВЕРСІЯ 2.9 (ПЕРЕЗАПУСК БОТА + ОНОВЛЕННЯ З GITHUB) ---
-BOT_VERSION = "2.9 (Перезапуск бота та оновлення з GitHub)"
+# --- ВЕРСІЯ 3.0 (RUSTDESK: ПІДТВЕРДЖЕННЯ ВХІДНИХ ПІДКЛЮЧЕНЬ У TELEGRAM) ---
+BOT_VERSION = "3.0 (RustDesk: підтвердження підключень у Telegram)"
 
 # Папка бота за дефолтом
 botDir = os.path.join(os.environ.get('LOCALAPPDATA', ''), 'ControlPC')
@@ -72,6 +73,7 @@ def get_system_menu():
     markup.row("📝 Процеси", "📸 Фото з камери")
     markup.row("📋 Буфер обміну", "🖥 Дистанційне керування")
     markup.row("📥 Встановити додаток")
+    markup.row("🔔 RustDesk захист")
     markup.row("🔄 Перезапустити бота")
     markup.row("❌ Вимкнути ПК", "🔄 Перезавантажити")
     markup.add("🔙 Головне меню")
@@ -766,6 +768,496 @@ def handle_install_callback(call):
     threading.Thread(target=install_app_worker, args=(code,), daemon=True).start()
 
 # ==========================================
+# 3.4 RUSTDESK: ІНТЕРАКТИВНЕ ПІДТВЕРДЖЕННЯ ВХІДНИХ ПІДКЛЮЧЕНЬ
+# ==========================================
+# Ідея: бот стежить за появою вікна-запиту RustDesk (або нового з'єднання) і надсилає
+# в Telegram фото вікна з інлайн-кнопками «Прийняти» / «Відхилити».
+# «Прийняти» = бот сам виводить вікно RustDesk на передній план, знаходить основну
+# (акцентну) кнопку підтвердження через cv2 і натискає її за тебе - без твоєї участі.
+RS_PROCESS_NAME = "rustdesk.exe"
+RS_POLL_INTERVAL = 2.0          # як часто перевіряємо появу запиту на ПК, сек
+RS_REPROMPT_AFTER = 180         # якщо запит «висить» довго - нагадуємо повторно, сек
+RS_MIN_WINDOW_AREA = 100 * 70   # дрібні службові вікна (IME, 16x16) не рахуємо запитом
+RS_IGNORE_CLASSES = {"ime", "tao thread event target", "msctfime ui", "tooltips_class32"}
+RS_MAIN_CLASSES = {"tray_icon_app"}   # головне вікно RustDesk саме по собі - ще не запит
+RS_CONFIRM_ENABLED = True       # чи надсилати запити в Telegram (перемикається кнопкою)
+
+RS_PROMPT_LOCK = threading.Lock()
+RS_PENDING = {}                 # hwnd запиту -> час останнього повідомлення
+RS_KNOWN_ENDPOINTS = set()      # уже відомі з'єднання RustDesk (щоб не спамити)
+RS_CV_LOCK = threading.Lock()
+RS_CV_CACHE = {"hwnd": None, "time": 0.0, "result": False}
+
+class _RS_RECT(ctypes.Structure):
+    """Прямокутник вікна (локальна копія RECT, щоб не тягнути ctypes.wintypes)."""
+    _fields_ = [("left", ctypes.c_long), ("top", ctypes.c_long),
+                ("right", ctypes.c_long), ("bottom", ctypes.c_long)]
+
+def _rs_log(text):
+    """Пише події RustDesk у загальний лог бота (bot_errors.txt)."""
+    try:
+        with open(os.path.join(botDir, "bot_errors.txt"), "a", encoding="utf-8") as f:
+            f.write(f"[RustDesk] {datetime.datetime.now()}: {text}\n")
+    except Exception:
+        pass
+
+def _rs_pids():
+    """PID-и всіх запущених процесів RustDesk."""
+    pids = set()
+    for proc in psutil.process_iter(["name", "pid"]):
+        try:
+            if (proc.info.get("name") or "").lower() == RS_PROCESS_NAME:
+                pids.add(proc.info["pid"])
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+    return pids
+
+def _rs_windows():
+    """Верхньорівневі вікна RustDesk: hwnd -> (заголовок, клас, (l, t, r, b), видиме)."""
+    pids = _rs_pids()
+    if not pids:
+        return {}
+    user32 = ctypes.windll.user32
+    windows = {}
+
+    def _callback(hwnd, _lparam):
+        pid = ctypes.c_ulong()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        if pid.value in pids:
+            length = user32.GetWindowTextLengthW(hwnd)
+            title = ctypes.create_unicode_buffer(length + 1)
+            user32.GetWindowTextW(hwnd, title, length + 1)
+            class_name = ctypes.create_unicode_buffer(256)
+            user32.GetClassNameW(hwnd, class_name, 256)
+            rect = _RS_RECT()
+            user32.GetWindowRect(hwnd, ctypes.byref(rect))
+            windows[int(hwnd)] = (title.value, class_name.value,
+                                  (rect.left, rect.top, rect.right, rect.bottom),
+                                  bool(user32.IsWindowVisible(hwnd)))
+        return True
+
+    enum_proc = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
+    user32.EnumWindows(enum_proc(_callback), 0)
+    return windows
+
+def _rs_area(info):
+    """Площа вікна - допомагає відрізнити діалог (малий) від головного вікна (велике)."""
+    rect = info[2]
+    return max(0, rect[2] - rect[0]) * max(0, rect[3] - rect[1])
+
+def _rs_is_window(info):
+    """Чи це «справжнє» видиме вікно, а не службовий помічник RustDesk."""
+    _title, class_name, _rect, visible = info
+    if not visible or _rs_area(info) < RS_MIN_WINDOW_AREA:
+        return False
+    return (class_name or "").strip().lower() not in RS_IGNORE_CLASSES
+
+def _rs_is_dialog(info):
+    """Чи це окреме вікно-діалог RustDesk (а не головне вікно програми)."""
+    return _rs_is_window(info) and (info[1] or "").strip().lower() not in RS_MAIN_CLASSES
+
+def _rs_cv_buttons(shot):
+    """Шукає кнопки діалогу через cv2. Повертає центри знайдених акцентних кнопок."""
+    buttons = []
+    try:
+        frame = cv2.cvtColor(np.array(shot.convert("RGB")), cv2.COLOR_RGB2BGR)
+        height = frame.shape[0]
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        # акцентна (синя) кнопка RustDesk
+        mask = cv2.inRange(hsv, np.array([95, 90, 90]), np.array([130, 255, 255]))
+        mask[: int(height * 0.45), :] = 0      # кнопки завжди в нижній частині діалогу
+        contours, _hierarchy = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        found = []
+        for contour in contours:
+            x, y, width, box_height = cv2.boundingRect(contour)
+            if width >= 40 and box_height >= 18 and width >= box_height:
+                found.append((width * box_height, x + width // 2, y + box_height // 2))
+        found.sort(reverse=True)
+        buttons.extend((x, y) for _area, x, y in found[:2])
+    except Exception as e:
+        _rs_log(f"cv2: {e}")
+    return buttons
+
+def _rs_window_shot(rect):
+    """Скріншот області вікна (для cv2 та для фото в Telegram)."""
+    left, top, right, bottom = rect
+    width, height = right - left, bottom - top
+    if width < 40 or height < 40:
+        return None
+    try:
+        return pyautogui.screenshot(region=(int(left), int(top), int(width), int(height)))
+    except Exception as e:
+        _rs_log(f"screenshot: {e}")
+        return None
+
+def _rs_has_dialog_button(hwnd, info):
+    """Чи є у вікні характерна кнопка діалогу (перевірка через cv2, з кешем 2.5 с)."""
+    now = time.time()
+    with RS_CV_LOCK:
+        if RS_CV_CACHE["hwnd"] == hwnd and now - RS_CV_CACHE["time"] < 2.5:
+            return RS_CV_CACHE["result"]
+    shot = _rs_window_shot(info[2])
+    result = bool(shot is not None and _rs_cv_buttons(shot))
+    with RS_CV_LOCK:
+        RS_CV_CACHE["hwnd"] = hwnd
+        RS_CV_CACHE["time"] = now
+        RS_CV_CACHE["result"] = result
+    return result
+
+def _rs_detect_prompt(windows):
+    """Знаходить вікно-запит: спершу окремий діалог, далі діалог у головному вікні RustDesk."""
+    dialogs = sorted(((hwnd, info) for hwnd, info in windows.items() if _rs_is_dialog(info)),
+                     key=lambda pair: _rs_area(pair[1]))
+    if dialogs:
+        return dialogs[0][0], dialogs[0][1], ""
+
+    mains = sorted(((hwnd, info) for hwnd, info in windows.items() if _rs_is_window(info)),
+                   key=lambda pair: _rs_area(pair[1]))
+    for hwnd, info in mains[:2]:
+        if _rs_has_dialog_button(hwnd, info):
+            return hwnd, info, "У вікні RustDesk знайдено діалог підтвердження."
+    return None, None, ""
+
+def _rs_endpoints():
+    """Активні TCP-з'єднання RustDesk (хто і куди підключений) - сигнал «сесія почалась»."""
+    pids = _rs_pids()
+    endpoints = set()
+    if not pids:
+        return endpoints
+    try:
+        for conn in psutil.net_connections(kind="tcp"):
+            if conn.pid in pids and conn.status == psutil.CONN_ESTABLISHED and conn.raddr:
+                ip = getattr(conn.raddr, "ip", None) or conn.raddr[0]
+                port = getattr(conn.raddr, "port", None) or conn.raddr[1]
+                endpoints.add((ip, port))
+    except (psutil.AccessDenied, OSError):
+        pass
+    return endpoints
+
+def _rs_approve_mode():
+    """Читає режим підтвердження RustDesk (approve-mode) з RustDesk2.toml."""
+    config_path = os.path.join(os.environ.get("APPDATA", ""), "RustDesk", "config", "RustDesk2.toml")
+    try:
+        with open(config_path, "r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                line = line.strip()
+                if line.lower().startswith("approve-mode") and "=" in line:
+                    return line.split("=", 1)[1].strip().strip("'\"") or "password"
+    except Exception:
+        pass
+    return "password (типово)"
+
+def _rs_activate(hwnd):
+    """Виводить вікно RustDesk на передній план (обхід блокування фокуса Windows)."""
+    user32 = ctypes.windll.user32
+    try:
+        # HWND передаємо як c_void_p, інакше на 64-бітній системі ctypes ріже його до int
+        hwnd_ptr = ctypes.c_void_p(hwnd)
+        user32.GetForegroundWindow.restype = ctypes.c_void_p
+        user32.ShowWindow(hwnd_ptr, 9)          # SW_RESTORE
+        user32.BringWindowToTop(hwnd_ptr)
+        user32.keybd_event(0x12, 0, 0, 0)       # Alt down - знімає блокування фокуса
+        user32.keybd_event(0x12, 0, 2, 0)       # Alt up
+        user32.SetForegroundWindow(hwnd_ptr)
+        time.sleep(0.4)
+        return user32.GetForegroundWindow() == hwnd
+    except Exception as e:
+        _rs_log(f"activate: {e}")
+        return False
+
+def _rs_click(rect, point):
+    """Клік мишею у точці point (координати всередині вікна)."""
+    pyautogui.moveTo(int(rect[0] + point[0]), int(rect[1] + point[1]), duration=0.2)
+    pyautogui.click()
+
+def _rs_accept_points(shot):
+    """Точки-кандидати для кліку по кнопці «Прийняти» (координати всередині вікна)."""
+    points = list(_rs_cv_buttons(shot)) if shot is not None else []
+    width, height = shot.size if shot is not None else (800, 600)
+    points.append((int(width * 0.78), int(height * 0.88)))   # головна кнопка діалогу
+    points.append((int(width * 0.60), int(height * 0.88)))
+    points.append((int(width * 0.78), int(height * 0.80)))
+    unique = []
+    for point in points:
+        if point not in unique:
+            unique.append(point)
+    return unique
+
+def _rs_wait_result(hwnd, before_endpoints, timeout=8.0):
+    """Чекає результат дії: вікно-запит зникло АБО з'явилося активне з'єднання."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        time.sleep(0.7)
+        windows = _rs_windows()
+        if hwnd not in windows or not _rs_is_window(windows[hwnd]):
+            return True, "вікно запиту закрилося"
+        if _rs_endpoints() - before_endpoints:
+            return True, "з'явилося активне з'єднання"
+    return False, "вікно запиту досі висить"
+
+def rustdesk_accept():
+    """Підтверджує вхідне підключення RustDesk. Повертає (успіх, текст для Telegram)."""
+    windows = _rs_windows()
+    hwnd, info, _note = _rs_detect_prompt(windows)
+    if not hwnd:
+        return False, ("❌ Не бачу вікна підтвердження RustDesk.\n"
+                       "Запит уже скасовано або режим підтвердження = пароль "
+                       "(тоді сесія відкривається без кліку).")
+    rect = info[2]
+    before = _rs_endpoints()
+    _rs_activate(hwnd)
+
+    for index, point in enumerate(_rs_accept_points(_rs_window_shot(rect)), start=1):
+        try:
+            _rs_click(rect, point)
+        except Exception as e:
+            _rs_log(f"accept click #{index}: {e}")
+            continue
+        time.sleep(0.8)
+        ok, reason = _rs_wait_result(hwnd, before, timeout=4.0)
+        if ok:
+            return True, f"✅ Підключення прийнято ({reason}, спроба {index})."
+
+    # Резервний варіант - Enter (у діалозі це типово «Прийняти»)
+    try:
+        _rs_activate(hwnd)
+        pyautogui.press("enter")
+        time.sleep(0.8)
+        ok, reason = _rs_wait_result(hwnd, before, timeout=5.0)
+        if ok:
+            return True, f"✅ Підключення прийнято ({reason}, Enter)."
+    except Exception as e:
+        _rs_log(f"accept enter: {e}")
+
+    return False, ("❌ Не вдалося натиснути «Прийняти» автоматично.\n"
+                   "Перевір: екран не заблокований, вікно RustDesk не перекрите іншими вікнами, "
+                   "або підтверди підключення вручну на ПК.")
+
+def rustdesk_decline():
+    """Відхиляє вхідне підключення RustDesk (Escape, далі закриття вікна запиту)."""
+    windows = _rs_windows()
+    hwnd, _info, _note = _rs_detect_prompt(windows)
+    if not hwnd:
+        return False, "ℹ️ Вікна підтвердження вже немає - запит скасовано."
+    before = _rs_endpoints()
+    _rs_activate(hwnd)
+
+    try:
+        pyautogui.press("escape")
+    except Exception as e:
+        _rs_log(f"decline escape: {e}")
+    ok, reason = _rs_wait_result(hwnd, before, timeout=4.0)
+    if ok:
+        return True, f"⛔ Підключення відхилено ({reason})."
+
+    try:
+        user32 = ctypes.windll.user32
+        user32.PostMessageW.argtypes = [ctypes.c_void_p, ctypes.c_uint,
+                                        ctypes.c_size_t, ctypes.c_ssize_t]
+        user32.PostMessageW(ctypes.c_void_p(hwnd), 0x0010, 0, 0)   # WM_CLOSE
+    except Exception as e:
+        _rs_log(f"decline close: {e}")
+    ok, reason = _rs_wait_result(hwnd, before, timeout=4.0)
+    if ok:
+        return True, f"⛔ Вікно запиту закрито ({reason})."
+    return False, "❌ Не вдалося відхилити автоматично - закрий вікно RustDesk вручну."
+
+def _rs_prompt_keyboard():
+    """Інлайн-кнопки підтвердження підключення."""
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        types.InlineKeyboardButton("✅ Прийняти", callback_data="rs_accept"),
+        types.InlineKeyboardButton("⛔ Відхилити", callback_data="rs_decline"),
+    )
+    return markup
+
+def get_rustdesk_panel():
+    """Інлайн-меню панелі RustDesk (перемикач + оновлення статусу)."""
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    if RS_CONFIRM_ENABLED:
+        markup.add(types.InlineKeyboardButton("⏸ Вимкнути автопідтвердження", callback_data="rs_toggle"))
+    else:
+        markup.add(types.InlineKeyboardButton("▶️ Увімкнути автопідтвердження", callback_data="rs_toggle"))
+    markup.add(types.InlineKeyboardButton("🔄 Оновити статус", callback_data="rs_status"))
+    return markup
+
+def _rs_panel_text():
+    """Текст панелі RustDesk: чи запущено, скільки з'єднань, режим підтвердження."""
+    pids = _rs_pids()
+    endpoints = _rs_endpoints()
+    lines = [
+        "🔔 *RustDesk: підтвердження підключень*",
+        "",
+        ("🟢 Автопідтвердження: увімкнено" if RS_CONFIRM_ENABLED else "⚪️ Автопідтвердження: вимкнено"),
+        (f"🧩 Процесів RustDesk: {len(pids)}" if pids else "🔴 RustDesk не запущено"),
+        f"🌐 Активних з'єднань: {len(endpoints)}",
+        f"🔐 approve-mode: {_rs_approve_mode()}",
+        f"⏳ Запитів у черзі: {len(RS_PENDING)}",
+        "",
+        "Коли на ПК з'явиться запит на підключення, я надішлю фото вікна",
+        "з кнопками «Прийняти» / «Відхилити». «Прийняти» - бот сам",
+        "натисне кнопку підтвердження на ПК, без твоєї участі.",
+    ]
+    if endpoints:
+        lines.append("")
+        lines.append("Останні з'єднання:")
+        for ip, port in sorted(endpoints)[:5]:
+            lines.append(f"• `{ip}:{port}`")
+    return "\n".join(lines)
+
+def _rs_notify_prompt(hwnd, info, note=""):
+    """Надсилає в Telegram запит підтвердження: фото вікна + інлайн-кнопки."""
+    rect = info[2]
+    remote = ", ".join(f"{ip}:{port}" for ip, port in sorted(_rs_endpoints())[:3]) or "невідомо"
+    text = (
+        "🔔 *Вхідне підключення RustDesk!*\n\n"
+        f"💻 ПК: {PC_NAME}\n"
+        f"🌐 З'єднання: `{remote}`\n"
+        f"🔐 approve-mode: {_rs_approve_mode()}\n"
+    )
+    if note:
+        text += f"ℹ️ {note}\n"
+    text += "\nПідтверди сесію прямо звідси 👇"
+
+    shot = _rs_window_shot(rect)
+    if shot is not None:
+        try:
+            buffer = io.BytesIO()
+            shot.convert("RGB").save(buffer, format="JPEG", quality=80)
+            buffer.seek(0)
+            buffer.name = "rustdesk_request.jpg"
+            bot.send_photo(MY_ID, buffer, caption=text, parse_mode="Markdown",
+                           reply_markup=_rs_prompt_keyboard())
+            return
+        except Exception as e:
+            _rs_log(f"send_photo: {e}")
+
+    try:
+        bot.send_message(MY_ID, text, parse_mode="Markdown", reply_markup=_rs_prompt_keyboard())
+    except Exception:
+        try:
+            bot.send_message(MY_ID, text.replace("*", "").replace("`", ""),
+                             reply_markup=_rs_prompt_keyboard())
+        except Exception as e:
+            _rs_log(f"send_message: {e}")
+
+def _rs_notify_endpoints(endpoints):
+    """Повідомляє про нове з'єднання RustDesk (коли окремого вікна-запиту немає)."""
+    text = (
+        "🔔 *RustDesk: нове з'єднання на ПК*\n\n"
+        f"💻 ПК: {PC_NAME}\n"
+        + "".join(f"🌐 `{ip}:{port}`\n" for ip, port in sorted(endpoints)[:3])
+        + "\nЯкщо це ти - натисни «Прийняти», і я підтверджу вікно на ПК "
+          "(якщо воно є). «Відхилити» закриє запит."
+    )
+    try:
+        bot.send_message(MY_ID, text, parse_mode="Markdown", reply_markup=_rs_prompt_keyboard())
+    except Exception as e:
+        _rs_log(f"notify endpoints: {e}")
+
+def _rs_watch_loop():
+    """Фоновий спостерігач: ловить запит/сесію RustDesk і питає підтвердження в Telegram."""
+    global RS_KNOWN_ENDPOINTS
+    try:
+        RS_KNOWN_ENDPOINTS = _rs_endpoints()
+    except Exception:
+        RS_KNOWN_ENDPOINTS = set()
+
+    while True:
+        try:
+            if RS_CONFIRM_ENABLED:
+                windows = _rs_windows()
+                new_endpoints = _rs_endpoints() - RS_KNOWN_ENDPOINTS
+                hwnd, info, note = _rs_detect_prompt(windows)
+                now = time.time()
+
+                if hwnd:
+                    with RS_PROMPT_LOCK:
+                        last = RS_PENDING.get(hwnd)
+                        should_notify = last is None or now - last > RS_REPROMPT_AFTER
+                        if should_notify:
+                            RS_PENDING[hwnd] = now
+                    if should_notify:
+                        RS_KNOWN_ENDPOINTS |= new_endpoints
+                        if not note and new_endpoints:
+                            note = "З'явилося нове з'єднання RustDesk."
+                        _rs_notify_prompt(hwnd, info, note)
+                elif new_endpoints:
+                    RS_KNOWN_ENDPOINTS |= new_endpoints
+                    _rs_notify_endpoints(new_endpoints)
+
+                with RS_PROMPT_LOCK:
+                    alive = set(windows)
+                    for pending in list(RS_PENDING):
+                        if pending not in alive:
+                            RS_PENDING.pop(pending, None)
+        except Exception as e:
+            _rs_log(f"watch loop: {e}")
+            time.sleep(5)
+        time.sleep(RS_POLL_INTERVAL)
+
+def _rs_action_worker(action):
+    """Виконує прийняття/відхилення у фоні, щоб Telegram не чекав на відповідь."""
+    try:
+        if action == "rs_accept":
+            _ok, result = rustdesk_accept()
+        else:
+            _ok, result = rustdesk_decline()
+    except Exception as e:
+        result = f"❌ Помилка RustDesk: {e}"
+
+    with RS_PROMPT_LOCK:
+        RS_PENDING.clear()
+    try:
+        bot.send_message(MY_ID, result, reply_markup=get_system_menu())
+    except Exception as e:
+        _rs_log(f"action result: {e}")
+
+@bot.callback_query_handler(func=lambda call: str(call.data or "").startswith("rs_"))
+def handle_rustdesk_callback(call):
+    """Обробляє кнопки RustDesk: Прийняти / Відхилити / статус / перемикач."""
+    global RS_CONFIRM_ENABLED
+    if str(call.from_user.id) != str(MY_ID):
+        bot.answer_callback_query(call.id, "⛔ Доступ заборонено")
+        return
+
+    action = call.data or ""
+
+    if action == "rs_toggle":
+        RS_CONFIRM_ENABLED = not RS_CONFIRM_ENABLED
+        bot.answer_callback_query(call.id, "🟢 Автопідтвердження увімкнено" if RS_CONFIRM_ENABLED
+                                 else "⚪️ Автопідтвердження вимкнено")
+    elif action == "rs_status":
+        bot.answer_callback_query(call.id, "🔄 Оновлюю статус")
+    elif action == "rs_accept":
+        bot.answer_callback_query(call.id, "✅ Приймаю підключення...")
+    elif action == "rs_decline":
+        bot.answer_callback_query(call.id, "⛔ Відхиляю підключення...")
+    else:
+        bot.answer_callback_query(call.id, "❓ Невідома дія")
+        return
+
+    # Панель статусу - просто перемальовуємо повідомлення
+    if action in ("rs_toggle", "rs_status"):
+        try:
+            bot.edit_message_text(_rs_panel_text(), MY_ID, call.message.message_id,
+                                  parse_mode="Markdown", reply_markup=get_rustdesk_panel())
+        except Exception:
+            try:
+                bot.edit_message_text(_rs_panel_text(), MY_ID, call.message.message_id,
+                                      reply_markup=get_rustdesk_panel())
+            except Exception as e:
+                _rs_log(f"edit panel: {e}")
+        return
+
+    # Прийняти / Відхилити - прибираємо кнопки і працюємо у фоні
+    try:
+        bot.edit_message_reply_markup(MY_ID, call.message.message_id, reply_markup=None)
+    except Exception:
+        pass
+    threading.Thread(target=_rs_action_worker, args=(action,), daemon=True).start()
+
+# ==========================================
 # 4. ГОЛОВНИЙ ОБРОБНИК КОМАНД ТА КНОПОК
 # ==========================================
 @bot.message_handler(content_types=['text'])
@@ -821,6 +1313,13 @@ def handle_text(message):
     elif msg == "🖥 Дистанційне керування":
         bot.send_message(MY_ID, "🔎 Перевіряю RustDesk / AnyDesk на ПК...")
         threading.Thread(target=remote_desktop_worker, daemon=True).start()
+    elif msg == "🔔 RustDesk захист":
+        try:
+            bot.send_message(MY_ID, _rs_panel_text(), parse_mode="Markdown",
+                             reply_markup=get_rustdesk_panel())
+        except Exception:
+            bot.send_message(MY_ID, _rs_panel_text().replace("*", "").replace("`", ""),
+                             reply_markup=get_rustdesk_panel())
     elif msg == "📥 Встановити додаток":
         bot.send_message(MY_ID,
                          "📥 *Автоматичне встановлення*\n\n"
@@ -911,6 +1410,10 @@ def handle_text(message):
         # sys.exit() у потоці-обробнику вбиває лише сам потік, тому жорстко завершуємо ВЕСЬ процес:
         # скрипт start_internal.bat (run_bot.ps1) підхопить це, перекачає файл з GitHub і запустить нову версію
         os._exit(0)
+
+# --- ФОНОВИЙ СПОСТЕРІГАЧ ВХІДНИХ ПІДКЛЮЧЕНЬ RUSTDESK ---
+# Стартуємо до polling: якщо на ПК уже висить запит, бот одразу надішле його в Telegram
+threading.Thread(target=_rs_watch_loop, daemon=True).start()
 
 if __name__ == "__main__":
     while True:
