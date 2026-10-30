@@ -15,6 +15,7 @@ import datetime
 import io
 import re
 import json
+import hashlib
 import shutil
 import tempfile
 import urllib.request
@@ -31,8 +32,8 @@ time.sleep(15)
 MY_ID = "7678008217" # Твій ID
 PC_NAME = platform.node()
 
-# --- ВЕРСІЯ 3.0 (RUSTDESK: ПІДТВЕРДЖЕННЯ ВХІДНИХ ПІДКЛЮЧЕНЬ У TELEGRAM) ---
-BOT_VERSION = "3.0 (RustDesk: підтвердження підключень у Telegram)"
+# --- ВЕРСІЯ 3.1 (ЗАПУЩЕНІ ДОДАТКИ: ПЕРЕГЛЯД ТА КОРЕКТНЕ ЗАКРИТТЯ) ---
+BOT_VERSION = "3.1 (Запущені додатки: перегляд та закриття)"
 
 # Папка бота за дефолтом
 botDir = os.path.join(os.environ.get('LOCALAPPDATA', ''), 'ControlPC')
@@ -70,7 +71,8 @@ def get_media_menu():
 
 def get_system_menu():
     markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
-    markup.row("📝 Процеси", "📸 Фото з камери")
+    markup.row("📝 Процеси", "📱 Запущені додатки")
+    markup.row("📸 Фото з камери")
     markup.row("📋 Буфер обміну", "🖥 Дистанційне керування")
     markup.row("📥 Встановити додаток")
     markup.row("🔔 RustDesk захист")
@@ -1258,6 +1260,570 @@ def handle_rustdesk_callback(call):
     threading.Thread(target=_rs_action_worker, args=(action,), daemon=True).start()
 
 # ==========================================
+# 3.5 ЗАПУЩЕНІ ДОДАТКИ: ПЕРЕГЛЯД ТА КОРЕКТНЕ ЗАКРИТТЯ
+# ==========================================
+# Ідея: бот сканує процеси Windows, відсіює системне сміття та фонові служби і показує
+# в Telegram лише суттєві програми (Chrome, VS Code, Провідник тощо) інлайн-кнопками.
+# Натиснув на програму - бачиш деталі та кнопку «❌ Закрити додаток»: спершу бот
+# ввічливо закриває вікна (WM_CLOSE), а якщо програма не відповіла - завершує процеси.
+APPS_MAX_BUTTONS = 25            # скільки програм показуємо кнопками (ліміт на клавіатуру)
+APPS_MIN_WINDOW_AREA = 120 * 80  # дрібні службові вікна не вважаємо вікном програми
+APPS_CLOSE_TIMEOUT = 3.0         # скільки чекаємо на коректне закриття, сек
+APPS_MAX_TITLES = 5              # скільки назв вікон показуємо в деталях
+
+# Службові вікна Windows (панель задач, робочий стіл, IME, спливашки) - це не програми
+APPS_IGNORE_CLASSES = {
+    "progman", "workerw", "shell_traywnd", "shell_secondarytraywnd",
+    "ime", "msctfime ui", "tao thread event target", "tooltips_class32",
+    "windows.ui.core.corewindow", "tasklistthumbbar", "dv2controlhost",
+    "windows.ui.input.inputsite.windowclass", "applicationmanager_immersive_window",
+}
+
+# Фонові служби та системні процеси - у списку програм їх не показуємо
+APPS_IGNORE_EXE = {
+    "system", "system idle process", "registry", "memory compression",
+    "smss.exe", "csrss.exe", "wininit.exe", "winlogon.exe", "services.exe",
+    "lsass.exe", "svchost.exe", "dwm.exe", "fontdrvhost.exe", "sihost.exe",
+    "ctfmon.exe", "conhost.exe", "dllhost.exe", "runtimebroker.exe",
+    "searchindexer.exe", "searchhost.exe", "startmenuexperiencehost.exe",
+    "shellexperiencehost.exe", "textinputhost.exe", "backgroundtaskhost.exe",
+    "securityhealthservice.exe", "securityhealthsystray.exe", "smartscreen.exe",
+    "wmiprvse.exe", "audiodg.exe", "spoolsv.exe", "msmpeng.exe",
+}
+
+# Ці процеси не можна закривати навіть випадково - інакше ПК «ляже»
+APPS_NEVER_CLOSE = {
+    "csrss.exe", "wininit.exe", "winlogon.exe", "services.exe", "lsass.exe",
+    "smss.exe", "dwm.exe", "svchost.exe", "system",
+}
+
+# Вікна цих процесів належать оболонці UWP (Калькулятор, Параметри, Фотографії) -
+# такі вікна обробляємо окремо: один запис на вікно і закриття через WM_CLOSE
+APPS_UWP_HOSTS = {"applicationframehost.exe"}
+
+# Бот і його ланчер - ці процеси завершувати заборонено (інакше бот «вб'є» себе).
+# Перевіряємо лише предків потрібного типу: якщо VS Code запущено з Провідника,
+# explorer.exe теж є предком бота, але закривати Провідник цілком безпечно.
+APPS_PROTECTED_LAUNCHERS = {
+    "python.exe", "pythonw.exe", "cmd.exe", "powershell.exe", "pwsh.exe",
+    "wscript.exe", "cscript.exe", "conhost.exe", "windowsterminal.exe",
+}
+
+class _APP_RECT(ctypes.Structure):
+    """Прямокутник вікна (локальна копія RECT, щоб секція була самодостатньою)."""
+    _fields_ = [("left", ctypes.c_long), ("top", ctypes.c_long),
+                ("right", ctypes.c_long), ("bottom", ctypes.c_long)]
+
+_APPS_WIN32 = {}
+
+def _apps_win32(name="user32"):
+    """Ліниво готує Win32-функції: argtypes обов'язкові, щоб 64-бітні HWND не обрізались."""
+    if name in _APPS_WIN32:
+        return _APPS_WIN32[name]
+    if name == "user32":
+        api = ctypes.windll.user32
+        api.GetWindowThreadProcessId.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_ulong)]
+        api.GetWindowThreadProcessId.restype = ctypes.c_ulong
+        api.IsWindowVisible.argtypes = [ctypes.c_void_p]
+        api.IsWindowVisible.restype = ctypes.c_bool
+        api.GetWindowTextLengthW.argtypes = [ctypes.c_void_p]
+        api.GetWindowTextLengthW.restype = ctypes.c_int
+        api.GetWindowTextW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_int]
+        api.GetWindowTextW.restype = ctypes.c_int
+        api.GetClassNameW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_int]
+        api.GetClassNameW.restype = ctypes.c_int
+        api.GetWindowRect.argtypes = [ctypes.c_void_p, ctypes.POINTER(_APP_RECT)]
+        api.GetWindowRect.restype = ctypes.c_bool
+        api.GetWindowLongW.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        api.GetWindowLongW.restype = ctypes.c_long
+        api.IsIconic.argtypes = [ctypes.c_void_p]
+        api.IsIconic.restype = ctypes.c_bool
+        api.PostMessageW.argtypes = [ctypes.c_void_p, ctypes.c_uint, ctypes.c_void_p, ctypes.c_void_p]
+        api.PostMessageW.restype = ctypes.c_bool
+    else:
+        api = ctypes.windll.dwmapi
+        api.DwmGetWindowAttribute.argtypes = [ctypes.c_void_p, ctypes.c_uint,
+                                              ctypes.c_void_p, ctypes.c_uint]
+        api.DwmGetWindowAttribute.restype = ctypes.c_long
+    _APPS_WIN32[name] = api
+    return api
+
+# Популярні програми: гарна назва та емодзі (показуємо навіть якщо програма працює у фоні)
+APPS_FRIENDLY = {
+    "chrome.exe": "🌐 Google Chrome",
+    "msedge.exe": "🌐 Microsoft Edge",
+    "firefox.exe": "🦊 Mozilla Firefox",
+    "opera.exe": "🌐 Opera",
+    "opera_gx.exe": "🌐 Opera GX",
+    "brave.exe": "🦁 Brave",
+    "vivaldi.exe": "🌐 Vivaldi",
+    "yandex.exe": "🌐 Яндекс Браузер",
+    "code.exe": "🧩 Visual Studio Code",
+    "code - insiders.exe": "🧩 VS Code Insiders",
+    "cursor.exe": "🧩 Cursor",
+    "devenv.exe": "🟣 Visual Studio",
+    "pycharm64.exe": "🐍 PyCharm",
+    "idea64.exe": "🧠 IntelliJ IDEA",
+    "webstorm64.exe": "🧠 WebStorm",
+    "sublime_text.exe": "📝 Sublime Text",
+    "notepad++.exe": "📝 Notepad++",
+    "notepad.exe": "📝 Notepad",
+    "explorer.exe": "📁 Провідник",
+    "windowsterminal.exe": "⌨️ Windows Terminal",
+    "telegram.exe": "✈️ Telegram",
+    "discord.exe": "💬 Discord",
+    "viber.exe": "💬 Viber",
+    "whatsapp.exe": "💬 WhatsApp",
+    "slack.exe": "💬 Slack",
+    "teams.exe": "💬 Microsoft Teams",
+    "ms-teams.exe": "💬 Microsoft Teams",
+    "zoom.exe": "🎥 Zoom",
+    "skype.exe": "💬 Skype",
+    "steam.exe": "🎮 Steam",
+    "epicgameslauncher.exe": "🎮 Epic Games",
+    "spotify.exe": "🎵 Spotify",
+    "vlc.exe": "🎬 VLC",
+    "wmplayer.exe": "🎬 Windows Media Player",
+    "obs64.exe": "🎥 OBS Studio",
+    "winword.exe": "📄 Microsoft Word",
+    "excel.exe": "📊 Microsoft Excel",
+    "powerpnt.exe": "📊 PowerPoint",
+    "outlook.exe": "📧 Outlook",
+    "acrobat.exe": "📕 Adobe Acrobat",
+    "acrord32.exe": "📕 Acrobat Reader",
+    "photoshop.exe": "🎨 Photoshop",
+    "figma.exe": "🎨 Figma",
+    "taskmgr.exe": "📊 Диспетчер задач",
+    "mstsc.exe": "🖥 Віддалений робочий стіл",
+    "rustdesk.exe": "🔴 RustDesk",
+    "anydesk.exe": "🔵 AnyDesk",
+    "teamviewer.exe": "🟦 TeamViewer",
+    "mintty.exe": "⌨️ Git Bash",
+    "postman.exe": "🧪 Postman",
+    "docker desktop.exe": "🐳 Docker Desktop",
+    "thunderbird.exe": "📧 Thunderbird",
+    "python.exe": "🐍 Python",
+}
+
+def _apps_log(text):
+    """Пише події керування додатками у загальний лог бота (bot_errors.txt)."""
+    try:
+        with open(os.path.join(botDir, "bot_errors.txt"), "a", encoding="utf-8") as f:
+            f.write(f"[Apps] {datetime.datetime.now()}: {text}\n")
+    except Exception:
+        pass
+
+def _apps_short(text, limit=60):
+    """Обрізає довгий текст, щоб не роздувати кнопки та повідомлення."""
+    text = " ".join(str(text).split())
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+def _apps_md(text):
+    """Прибирає символи Markdown - назви вікон не мають ламати розмітку повідомлення."""
+    return re.sub(r"[*_`\[\]]", "", str(text))
+
+def _apps_mb(value):
+    """Мегабайти у зручний рядок (МБ / ГБ)."""
+    return f"{value / 1024:.1f} ГБ" if value >= 1024 else f"{value:.0f} МБ"
+
+def _apps_uptime(started):
+    """Скільки часу працює програма, у людському вигляді."""
+    seconds = max(0, int(time.time() - started))
+    hours, remainder = divmod(seconds, 3600)
+    if hours:
+        return f"{hours} г {remainder // 60:02d} хв"
+    return f"{remainder // 60} хв"
+
+def _apps_cloaked(hwnd):
+    """«Привид» закритого UWP-вікна: IsWindowVisible=True, але вікно не показується."""
+    try:
+        value = ctypes.c_int(0)
+        result = _apps_win32("dwmapi").DwmGetWindowAttribute(
+            ctypes.c_void_p(hwnd), 14, ctypes.byref(value), ctypes.sizeof(value))   # DWMWA_CLOAKED
+        return result == 0 and value.value != 0
+    except Exception:
+        return False
+
+def _apps_windows():
+    """Справжні видимі вікна Windows: pid -> список (hwnd, заголовок)."""
+    user32 = _apps_win32("user32")
+    windows = {}
+
+    def _callback(hwnd, _lparam):
+        try:
+            if not user32.IsWindowVisible(hwnd) or _apps_cloaked(hwnd):
+                return True
+            ex_style = user32.GetWindowLongW(hwnd, -20)                 # GWL_EXSTYLE
+            if ex_style & 0x00000080:                                   # WS_EX_TOOLWINDOW
+                return True
+            length = user32.GetWindowTextLengthW(hwnd)
+            if length <= 0:
+                return True
+            title = ctypes.create_unicode_buffer(length + 1)
+            user32.GetWindowTextW(hwnd, title, length + 1)
+            class_name = ctypes.create_unicode_buffer(256)
+            user32.GetClassNameW(hwnd, class_name, 256)
+            if (class_name.value or "").strip().lower() in APPS_IGNORE_CLASSES:
+                return True
+            rect = _APP_RECT()
+            user32.GetWindowRect(hwnd, ctypes.byref(rect))
+            area = max(0, rect.right - rect.left) * max(0, rect.bottom - rect.top)
+            # згорнуте вікно має координати -32000, тому площу перевіряємо лише для звичайних
+            if area < APPS_MIN_WINDOW_AREA and not user32.IsIconic(hwnd):
+                return True
+            pid = ctypes.c_ulong()
+            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+            if pid.value:
+                windows.setdefault(pid.value, []).append((int(hwnd), title.value))
+        except Exception as e:
+            _apps_log(f"window callback: {e}")
+        return True
+
+    enum_proc = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
+    user32.EnumWindows(enum_proc(_callback), 0)
+    return windows
+
+def _apps_protected_pids():
+    """PID-и бота та його ланчера - завершувати їх заборонено (інакше бот «вб'є» себе)."""
+    pids = {os.getpid()}
+    try:
+        proc = psutil.Process()
+        while True:
+            parent = proc.parent()
+            if parent is None or parent.pid in pids:
+                break
+            if (parent.name() or "").lower() in APPS_PROTECTED_LAUNCHERS:
+                pids.add(parent.pid)
+            proc = parent
+    except Exception:
+        pass
+    pids.discard(0)
+    return pids
+
+def _apps_token(key):
+    """Короткий стабільний токен для callback_data (ліміт Telegram - 64 символи)."""
+    return hashlib.md5(str(key).encode("utf-8", "ignore")).hexdigest()[:12]
+
+def _apps_new_entry(exe):
+    """Порожній запис програми з гарною назвою (або «📦 Ім'я» для невідомих)."""
+    name = APPS_FRIENDLY.get(exe)
+    if not name:
+        stem = os.path.splitext(exe)[0]
+        name = "📦 " + (stem[:1].upper() + stem[1:])
+    return {"name": name, "exe": exe, "pids": [], "windows": [],
+            "ram_mb": 0.0, "cpu": 0.0, "started": None, "uwp": False}
+
+def _apps_scan():
+    """Сканує процеси та повертає список суттєвих програм (з вікнами або з популярних)."""
+    try:
+        windows = _apps_windows()
+    except Exception as e:
+        _apps_log(f"enum windows: {e}")
+        windows = {}
+    protected = _apps_protected_pids()
+    apps = {}
+    uwp_pids = set()
+
+    for proc in psutil.process_iter(["name", "pid", "memory_info", "cpu_percent", "create_time"]):
+        try:
+            info = proc.info
+            exe = (info.get("name") or "").lower()
+            pid = info["pid"]
+            if not exe or pid in protected or exe in APPS_IGNORE_EXE:
+                continue
+            if exe in APPS_UWP_HOSTS:
+                uwp_pids.add(pid)       # розбираємо нижче - окремим записом на кожне вікно
+                continue
+            wins = windows.get(pid, [])
+            if not wins and exe not in APPS_FRIENDLY:
+                continue                 # ні вікна, ні популярна програма - це фонова служба
+            entry = apps.get(exe) or apps.setdefault(exe, _apps_new_entry(exe))
+            entry["pids"].append(pid)
+            memory = info.get("memory_info")
+            if memory is not None:
+                entry["ram_mb"] += memory.rss / (1024 * 1024)
+            entry["cpu"] += info.get("cpu_percent") or 0.0
+            created = info.get("create_time")
+            if created and (entry["started"] is None or created < entry["started"]):
+                entry["started"] = created
+            for hwnd, title in wins:
+                entry["windows"].append((hwnd, title))
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+        except Exception as e:
+            _apps_log(f"scan process: {e}")
+            continue
+
+    # UWP-додатки (Калькулятор, Параметри, Фотографії): вікно належить ApplicationFrameHost,
+    # тому робимо окремий запис на кожне вікно і закриваємо його через WM_CLOSE
+    for pid in uwp_pids:
+        for hwnd, title in windows.get(pid, []):
+            key = "uwp:" + title.lower()
+            if key in apps:
+                apps[key]["windows"].append((hwnd, title))
+                continue
+            apps[key] = {"name": "🪟 " + (_apps_short(_apps_md(title), 40) or "UWP-додаток"),
+                         "exe": "applicationframehost.exe", "pids": [],
+                         "windows": [(hwnd, title)], "ram_mb": 0.0, "cpu": 0.0,
+                         "started": None, "uwp": True}
+
+    result = []
+    for key, entry in apps.items():
+        entry["key"] = key
+        entry["token"] = _apps_token(key)
+        result.append(entry)
+    # спершу програми з вікнами, далі - за споживанням пам'яті
+    result.sort(key=lambda app: (not app["windows"], -app["ram_mb"], app["name"].lower()))
+    return result
+
+def _apps_find(token):
+    """Знаходить програму зі списку за токеном (стан завжди свіжий - пересканування)."""
+    token = str(token or "")
+    for app in _apps_scan():
+        if app["token"] == token:
+            return app
+    return None
+
+def _apps_list_text(apps):
+    """Текст повідомлення зі списком запущених програм."""
+    if not apps:
+        return ("📱 *Запущені додатки*\n\n"
+                "😴 Суттєвих програм зараз не запущено - усі фонові служби приховані.")
+    lines = [
+        "📱 *Запущені додатки*",
+        "",
+        f"🟢 Програм: {len(apps)}",
+        f"🪟 Видимих вікон: {sum(len(app['windows']) for app in apps)}",
+        f"💾 Разом RAM: {_apps_mb(sum(app['ram_mb'] for app in apps))}",
+        "",
+        "Обери програму нижче - покажу деталі та дам кнопку «❌ Закрити додаток».",
+        "_Системні служби та фонові процеси приховані._",
+    ]
+    if len(apps) > APPS_MAX_BUTTONS:
+        lines.append(f"ℹ️ Показано перші {APPS_MAX_BUTTONS} із {len(apps)} програм.")
+    return "\n".join(lines)
+
+def get_apps_menu(apps=None):
+    """Інлайн-кнопки зі списком програм + оновлення списку та вихід у меню."""
+    if apps is None:
+        apps = _apps_scan()
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    for app in apps[:APPS_MAX_BUTTONS]:
+        windows = len(app["windows"])
+        if windows > 1:
+            label = f"{app['name']} · {windows} вікн."
+        elif windows == 0:
+            label = f"{app['name']} · у фоні"
+        else:
+            label = app["name"]
+        markup.add(types.InlineKeyboardButton(_apps_short(label, 60),
+                                              callback_data=f"app_info_{app['token']}"))
+    markup.add(types.InlineKeyboardButton("🔄 Оновити список", callback_data="app_list"))
+    markup.add(types.InlineKeyboardButton("🔙 Головне меню", callback_data="app_back"))
+    return markup
+
+def _apps_app_menu(app):
+    """Інлайн-меню конкретної програми: закрити / оновити / назад до списку."""
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    markup.add(types.InlineKeyboardButton("❌ Закрити додаток",
+                                          callback_data=f"app_kill_{app['token']}"))
+    markup.add(types.InlineKeyboardButton("🔄 Оновити дані",
+                                          callback_data=f"app_info_{app['token']}"))
+    markup.add(types.InlineKeyboardButton("🔙 До списку", callback_data="app_list"))
+    return markup
+
+def _apps_details_text(app):
+    """Деталі однієї програми: процеси, пам'ять, вікна та що саме зробить бот."""
+    lines = [app["name"], ""]
+    lines.append(f"🔹 Файл: `{app['exe']}`")
+    if app["pids"]:
+        lines.append(f"🧩 Процесів: {len(app['pids'])}")
+    windows = len(app["windows"])
+    lines.append(f"🪟 Вікон: {windows}" if windows else "🪟 Вікон: 0 (працює у фоні)")
+    if app["ram_mb"]:
+        lines.append(f"💾 RAM: {_apps_mb(app['ram_mb'])}")
+    if app["cpu"]:
+        lines.append(f"⚙️ CPU: {app['cpu']:.1f}%")
+    if app["started"]:
+        started = datetime.datetime.fromtimestamp(app["started"]).strftime("%H:%M")
+        lines.append(f"⏱ Працює: {_apps_uptime(app['started'])} (з {started})")
+    titles = [_apps_short(_apps_md(title), 70) for _hwnd, title in app["windows"] if title]
+    if titles:
+        lines.append("")
+        lines.append("📄 Вікна:")
+        for title in titles[:APPS_MAX_TITLES]:
+            lines.append(f"• {title}")
+    lines.append("")
+    if app["uwp"]:
+        lines.append("Це UWP-додаток Windows - закрию його вікно (WM_CLOSE).")
+    elif app["exe"] == "explorer.exe":
+        lines.append("⚠️ Це Провідник Windows: після закриття система запустить його знову.")
+    else:
+        lines.append("Спершу спробую закрити вікна ввічливо (WM_CLOSE - без втрати даних),")
+        lines.append("а якщо програма не відповість - завершу її процеси.")
+    return "\n".join(lines)
+
+def _apps_send(text, markup=None):
+    """Надсилає повідомлення; якщо Markdown зламався - повторює без розмітки."""
+    try:
+        return bot.send_message(MY_ID, text, parse_mode="Markdown", reply_markup=markup)
+    except Exception:
+        try:
+            return bot.send_message(MY_ID, text.replace("*", "").replace("`", ""),
+                                    reply_markup=markup)
+        except Exception as e:
+            _apps_log(f"send: {e}")
+            return None
+
+def _apps_edit(call, text, markup):
+    """Редагує повідомлення зі списком; якщо Telegram відмовив - надсилає нове."""
+    try:
+        bot.edit_message_text(text, MY_ID, call.message.message_id,
+                              parse_mode="Markdown", reply_markup=markup)
+        return True
+    except Exception:
+        pass
+    try:
+        bot.edit_message_text(text.replace("*", "").replace("`", ""), MY_ID,
+                              call.message.message_id, reply_markup=markup)
+        return True
+    except Exception as e:
+        _apps_log(f"edit: {e}")
+        return False
+
+def _apps_post_close(hwnd):
+    """Просить вікно закритись ввічливо (WM_CLOSE) - так програма може зберегти дані."""
+    try:
+        _apps_win32("user32").PostMessageW(ctypes.c_void_p(hwnd), 0x0010, None, None)   # WM_CLOSE
+        return True
+    except Exception as e:
+        _apps_log(f"WM_CLOSE {hwnd}: {e}")
+        return False
+
+def _apps_terminate(pids, protected):
+    """Завершує процеси: terminate() -> kill() для тих, хто не відповів. Повертає (м'яко, жорстко)."""
+    soft, hard = 0, 0
+    for pid in pids:
+        if pid in protected:
+            continue
+        try:
+            psutil.Process(pid).terminate()
+            soft += 1
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+    if soft:
+        time.sleep(1.2)
+    for pid in pids:
+        if pid in protected:
+            continue
+        try:
+            proc = psutil.Process(pid)
+            if proc.is_running() and proc.status() != psutil.STATUS_ZOMBIE:
+                proc.kill()
+                hard += 1
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+    if hard:
+        time.sleep(0.5)
+    return soft, hard
+
+def _apps_close(app):
+    """Коректно закриває програму. Повертає (успіх, текст для Telegram)."""
+    exe, name, token = app["exe"], app["name"], app["token"]
+    if exe in APPS_NEVER_CLOSE:
+        return False, f"⛔ {name} - системний процес, закривати його заборонено."
+
+    # 1. Ввічливо: просимо вікна закритись (програма встигне зберегти дані)
+    polite = False
+    for hwnd, _title in app["windows"]:
+        polite = _apps_post_close(hwnd) or polite
+    if polite:
+        time.sleep(1.5)
+        if _apps_find(token) is None:
+            return True, f"✅ {name} закрито (вікна закрились ввічливо, процес завершився)."
+
+    # 2. Завершуємо процеси: terminate(), а для «впертих» - kill()
+    protected = _apps_protected_pids()
+    soft, hard = _apps_terminate(app["pids"], protected)
+    deadline = time.time() + APPS_CLOSE_TIMEOUT
+    while time.time() < deadline:
+        if _apps_find(token) is None:
+            return True, f"✅ {name} закрито ({'примусово' if hard else 'штатно'})."
+        time.sleep(0.5)
+
+    # 3. Провідник Windows система піднімає автоматично - це нормальний результат
+    if exe == "explorer.exe":
+        reason = "закрито і перезапущено" if _apps_find(token) is not None else "закрито"
+        return True, f"✅ Провідник {reason} - Windows піднімає його сам."
+
+    tail = "" if (soft or hard) else "\nℹ️ Немає прав на завершення процесу - запусти бота від адміністратора."
+    return False, f"❌ {name} не вдалося закрити.{tail}"
+
+def _apps_close_worker(token):
+    """Закриває програму у фоні, щоб Telegram не чекав на відповідь."""
+    app = _apps_find(token)
+    if not app:
+        text = "⚠️ Програма вже не запущена."
+    else:
+        try:
+            _ok, text = _apps_close(app)
+        except Exception as e:
+            _apps_log(f"close {app['name']}: {e}")
+            text = f"❌ Помилка закриття {app['name']}: {e}"
+    try:
+        apps = _apps_scan()
+    except Exception:
+        apps = []
+    _apps_send(text, get_apps_menu(apps))
+
+@bot.callback_query_handler(func=lambda call: str(call.data or "").startswith("app_"))
+def handle_apps_callback(call):
+    """Кнопки «Запущені додатки»: список, деталі програми, закриття."""
+    if str(call.from_user.id) != str(MY_ID):
+        bot.answer_callback_query(call.id, "⛔ Доступ заборонено")
+        return
+
+    data = str(call.data or "")
+
+    if data == "app_list":
+        apps = _apps_scan()
+        bot.answer_callback_query(call.id, f"🔄 Оновлюю список ({len(apps)})")
+        if not _apps_edit(call, _apps_list_text(apps), get_apps_menu(apps)):
+            _apps_send(_apps_list_text(apps), get_apps_menu(apps))
+        return
+
+    if data == "app_back":
+        bot.answer_callback_query(call.id, "Повертаюсь у меню")
+        try:
+            bot.edit_message_reply_markup(MY_ID, call.message.message_id, reply_markup=None)
+        except Exception:
+            pass
+        bot.send_message(MY_ID, "Системні налаштування:", reply_markup=get_system_menu())
+        return
+
+    token = data.rsplit("_", 1)[-1]
+    app = _apps_find(token)
+    if not app:
+        bot.answer_callback_query(call.id, "⚠️ Програму вже закрито")
+        apps = _apps_scan()
+        if not _apps_edit(call, _apps_list_text(apps), get_apps_menu(apps)):
+            _apps_send(_apps_list_text(apps), get_apps_menu(apps))
+        return
+
+    if data.startswith("app_kill_"):
+        bot.answer_callback_query(call.id, f"❌ Закриваю {app['name']}")
+        try:
+            bot.edit_message_reply_markup(MY_ID, call.message.message_id, reply_markup=None)
+        except Exception:
+            pass
+        threading.Thread(target=_apps_close_worker, args=(token,), daemon=True).start()
+        return
+
+    bot.answer_callback_query(call.id, "ℹ️ Деталі програми")
+    if not _apps_edit(call, _apps_details_text(app), _apps_app_menu(app)):
+        _apps_send(_apps_details_text(app), _apps_app_menu(app))
+
+# ==========================================
 # 4. ГОЛОВНИЙ ОБРОБНИК КОМАНД ТА КНОПОК
 # ==========================================
 @bot.message_handler(content_types=['text'])
@@ -1329,6 +1895,15 @@ def handle_text(message):
         procs = sorted(psutil.process_iter(['name', 'memory_percent']), key=lambda x: x.info['memory_percent'], reverse=True)[:5]
         text = "🔝 ТОП-5 процесів:\n" + "\n".join([f"🔸 {p.info['name']} ({round(p.info['memory_percent'],1)}%)" for p in procs])
         bot.send_message(MY_ID, text)
+    elif msg == "📱 Запущені додатки":
+        bot.send_message(MY_ID, "🔎 Сканую запущені програми...")
+        try:
+            apps = _apps_scan()
+            _apps_send(_apps_list_text(apps), get_apps_menu(apps))
+        except Exception as e:
+            _apps_log(f"scan: {e}")
+            bot.send_message(MY_ID, f"❌ Не вдалося просканувати процеси: {e}",
+                             reply_markup=get_system_menu())
     elif msg == "📋 Буфер обміну":
         text = pyperclip.paste()
         bot.send_message(MY_ID, f"📋 Текст у буфері ПК:\n`{text}`", parse_mode="Markdown")
