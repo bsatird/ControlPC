@@ -11,7 +11,7 @@ $vbsFile = "$botDir\start_hidden.vbs"
 $tokenFile = "$botDir\token.txt"
 
 # ⚠️ ЗАМІНИ ЦЕ ПОСИЛАННЯ НА СВОЄ ПРЯМЕ ПОСИЛАННЯ НА CONTROLPC.PY (З REPOS/GIST)
-$botUrl = "https://gist.githubusercontent.com/bsatird/4ac4b17c4bb451308e9696875a5d7acc/raw/ControlPC.py"
+$botUrl = "https://raw.githubusercontent.com/bsatird/ControlPC/refs/heads/main/ControlPC.py"
 
 Write-Host "`n--- ПОЧАТОК АВТОМАТИЧНОГО ВСТАНОВЛЕННЯ БОТА ---" -ForegroundColor Magenta
 
