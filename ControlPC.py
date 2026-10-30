@@ -13,7 +13,10 @@ import time
 import datetime
 import io
 import re
+import json
 import shutil
+import tempfile
+import urllib.request
 from PIL import Image
 
 # --- ДОДАТКОВІ МОДУЛІ ДЛЯ НОВИХ ФУНКЦІЙ ---
@@ -27,8 +30,8 @@ time.sleep(15)
 MY_ID = "7678008217" # Твій ID
 PC_NAME = platform.node()
 
-# --- ВЕРСІЯ 2.7 (ШВИДКИЙ СКРІНШОТ + ВІДДАЛЕНИЙ ДОСТУП) ---
-BOT_VERSION = "2.7 (Швидкий скріншот + Віддалений доступ)"
+# --- ВЕРСІЯ 2.8 (АВТОМАТИЧНЕ ВСТАНОВЛЕННЯ ДОДАТКІВ) ---
+BOT_VERSION = "2.8 (Автоматичне встановлення додатків)"
 
 # Папка бота за дефолтом
 botDir = os.path.join(os.environ.get('LOCALAPPDATA', ''), 'ControlPC')
@@ -68,8 +71,22 @@ def get_system_menu():
     markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
     markup.row("📝 Процеси", "📸 Фото з камери")
     markup.row("📋 Буфер обміну", "🖥 Дистанційне керування")
+    markup.row("📥 Встановити додаток")
     markup.row("❌ Вимкнути ПК", "🔄 Перезавантажити")
     markup.add("🔙 Головне меню")
+    return markup
+
+# ІНЛАЙН-МЕНЮ ВСТАНОВЛЕННЯ ПРОГРАМ
+def get_install_menu():
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    markup.add(
+        types.InlineKeyboardButton("🔴 RustDesk", callback_data="install_rustdesk"),
+        types.InlineKeyboardButton("🔵 AnyDesk", callback_data="install_anydesk"),
+        types.InlineKeyboardButton("🟦 TeamViewer", callback_data="install_teamviewer"),
+        types.InlineKeyboardButton("🌐 Google Chrome", callback_data="install_chrome"),
+        types.InlineKeyboardButton("📄 Telegram Desktop", callback_data="install_telegram"),
+        types.InlineKeyboardButton("🔙 Назад в меню", callback_data="install_back"),
+    )
     return markup
 
 def get_files_menu():
@@ -541,6 +558,213 @@ def remote_desktop_worker():
         bot.send_message(MY_ID, f"❌ Помилка віддаленого доступу: {e}")
 
 # ==========================================
+# 3.3 АВТОМАТИЧНЕ ВСТАНОВЛЕННЯ ДОДАТКІВ (WINGET + ТИХИЙ ІНСТАЛЯТОР)
+# ==========================================
+TEMP_DIR = tempfile.gettempdir()
+
+# Куди AnyDesk ставиться при тихому встановленні
+ANYDESK_DIR = os.path.join(os.environ.get("ProgramFiles", r"C:\Program Files"), "AnyDesk")
+
+# Реєстр програм: winget ID + резервне посилання на інсталятор + ключі тихого запуску
+INSTALL_PROGRAMS = {
+    "rustdesk": {
+        "name": "RustDesk",
+        "winget_id": "RustDesk.RustDesk",
+        # RustDesk прибрали з репозиторію winget, тому спершу качаємо інсталятор напряму
+        "prefer": "installer",
+        "url": "https://api.github.com/repos/rustdesk/rustdesk/releases/latest",
+        "url_resolver": "rustdesk",          # посилання шукаємо через GitHub API
+        "installer": "rustdesk_setup.exe",
+        "silent_args": ["--silent-install"],
+    },
+    "anydesk": {
+        "name": "AnyDesk",
+        "winget_id": "AnyDesk.AnyDesk",
+        "url": "https://download.anydesk.com/AnyDesk.exe",
+        "installer": "anydesk_setup.exe",
+        "silent_args": ["--install", ANYDESK_DIR, "--silent"],
+    },
+    "teamviewer": {
+        "name": "TeamViewer",
+        "winget_id": "TeamViewer.TeamViewer",
+        "url": "https://download.teamviewer.com/download/TeamViewer_Setup_x64.exe",
+        "installer": "teamviewer_setup.exe",
+        "silent_args": ["/S"],
+    },
+    "chrome": {
+        "name": "Google Chrome",
+        "winget_id": "Google.Chrome",
+        "url": "https://dl.google.com/chrome/install/latest/chrome_installer.exe",
+        "installer": "chrome_installer.exe",
+        "silent_args": ["/silent", "/install"],
+    },
+    "telegram": {
+        "name": "Telegram Desktop",
+        "winget_id": "Telegram.TelegramDesktop",
+        "url": "https://telegram.org/dl/desktop/win64",
+        "installer": "telegram_setup.exe",
+        "silent_args": ["/VERYSILENT", "/NORESTART", "/SUPPRESSMSGBOXES", "/NOCANCEL"],
+    },
+}
+
+INSTALL_LOCK = threading.Lock()
+INSTALLING_NOW = set()      # які програми вже встановлюються (захист від подвійного кліку)
+
+def _install_find_winget():
+    """Шукає winget.exe у PATH та стандартних папках Windows."""
+    candidates = [shutil.which("winget")]
+    local_appdata = os.environ.get("LOCALAPPDATA", "")
+    if local_appdata:
+        candidates.append(os.path.join(local_appdata, "Microsoft", "WindowsApps", "winget.exe"))
+    program_files = os.environ.get("ProgramFiles", r"C:\Program Files")
+    candidates.append(os.path.join(program_files, "WindowsApps",
+                                   "Microsoft.DesktopAppInstaller_8wekyb3d8bbwe", "winget.exe"))
+    for path in candidates:
+        if path and os.path.exists(path):
+            return path
+    return None
+
+def _install_rustdesk_url():
+    """Бере пряме посилання на свіжий rustdesk-*-x86_64.exe через GitHub API."""
+    try:
+        request = urllib.request.Request(INSTALL_PROGRAMS["rustdesk"]["url"],
+                                         headers={"User-Agent": "ControlPC-Bot"})
+        with urllib.request.urlopen(request, timeout=20) as response:
+            data = json.loads(response.read().decode("utf-8", "ignore"))
+        for asset in data.get("assets", []):
+            if (asset.get("name") or "").lower().endswith("x86_64.exe"):
+                return asset.get("browser_download_url", "")
+    except Exception:
+        pass
+    return ""
+
+def _install_download(url, filename):
+    """Завантажує інсталятор у папку Temp (аналог Invoke-WebRequest -OutFile)."""
+    target = os.path.join(TEMP_DIR, filename)
+    request = urllib.request.Request(url, headers={
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
+    with urllib.request.urlopen(request, timeout=120) as response, open(target, "wb") as out_file:
+        shutil.copyfileobj(response, out_file)
+    return target
+
+def _install_run(cmd, timeout):
+    """Запускає команду без вікна консолі. Повертає (код_виходу, вивід)."""
+    result = subprocess.run(cmd, capture_output=True, text=True, errors="ignore",
+                            timeout=timeout, creationflags=CREATE_NO_WINDOW)
+    output = f"{result.stdout or ''}{result.stderr or ''}".strip()
+    return result.returncode, output
+
+def _install_by_winget(prog):
+    """Тихе встановлення через winget."""
+    winget_exe = _install_find_winget()
+    if not winget_exe:
+        return False, "winget не знайдено в системі"
+    cmd = [winget_exe, "install", "--id", prog["winget_id"], "-e", "--silent",
+           "--accept-source-agreements", "--accept-package-agreements"]
+    code, output = _install_run(cmd, timeout=900)
+    lowered = output.lower()
+    if code == 0 or "already installed" in lowered or "вже встановлено" in lowered:
+        return True, output
+    return False, output or f"winget код виходу: {code}"
+
+def _install_by_installer(prog):
+    """Тихе встановлення напряму з інсталятора (качаємо в Temp і запускаємо)."""
+    url = prog["url"]
+    if prog.get("url_resolver") == "rustdesk":
+        url = _install_rustdesk_url() or url
+    installer = _install_download(url, prog["installer"])
+    try:
+        code, output = _install_run([installer] + prog["silent_args"], timeout=1800)
+    finally:
+        try:
+            os.remove(installer)        # прибираємо за собою Temp
+        except OSError:
+            pass
+    if code in (0, 3010):               # 3010 = успішно, потрібен перезапуск
+        return True, output
+    return False, output or f"код інсталятора: {code}"
+
+def install_app_worker(code):
+    """Фонове встановлення програми: winget або тихий інсталятор (з резервною спробою)."""
+    prog = INSTALL_PROGRAMS.get(code)
+    if not prog:
+        return
+    name = prog["name"]
+    try:
+        # Порядок спроб: за замовчуванням winget -> інсталятор, для RustDesk - навпаки
+        attempts = ["installer", "winget"] if prog.get("prefer") == "installer" else ["winget", "installer"]
+        success, details = False, ""
+
+        for attempt in attempts:
+            try:
+                if attempt == "winget":
+                    success, attempt_details = _install_by_winget(prog)
+                else:
+                    success, attempt_details = _install_by_installer(prog)
+                if attempt_details:
+                    details = attempt_details
+            except Exception as e:
+                success, details = False, f"{attempt}: {e}"
+            if success:
+                break
+
+        if success:
+            bot.send_message(MY_ID, f"✅ {name} успішно встановлено!",
+                             reply_markup=get_system_menu())
+        else:
+            tail = (details or "").strip()
+            if len(tail) > 500:
+                tail = "..." + tail[-500:]
+            text = f"❌ Помилка при встановленні {name}."
+            if tail:
+                text += f"\n\n🔍 Деталі:\n{tail}"
+            bot.send_message(MY_ID, text, reply_markup=get_system_menu())
+    except Exception as e:
+        bot.send_message(MY_ID, f"❌ Помилка при встановленні {name}.\n\n🔍 Деталі:\n{e}",
+                         reply_markup=get_system_menu())
+    finally:
+        with INSTALL_LOCK:
+            INSTALLING_NOW.discard(code)
+
+@bot.callback_query_handler(func=lambda call: str(call.data or "").startswith("install_"))
+def handle_install_callback(call):
+    """Обробляє натискання інлайн-кнопок меню встановлення."""
+    if str(call.from_user.id) != str(MY_ID):
+        bot.answer_callback_query(call.id, "⛔ Доступ заборонено")
+        return
+
+    code = (call.data or "")[len("install_"):]
+
+    if code == "back":
+        bot.answer_callback_query(call.id, "Повертаюсь у меню")
+        try:
+            bot.edit_message_reply_markup(MY_ID, call.message.message_id, reply_markup=None)
+        except Exception:
+            pass
+        bot.send_message(MY_ID, "Головне меню:", reply_markup=get_main_menu())
+        return
+
+    prog = INSTALL_PROGRAMS.get(code)
+    if not prog:
+        bot.answer_callback_query(call.id, "❓ Невідома програма")
+        return
+
+    name = prog["name"]
+    with INSTALL_LOCK:
+        already_running = code in INSTALLING_NOW
+        if not already_running:
+            INSTALLING_NOW.add(code)
+
+    if already_running:
+        bot.answer_callback_query(call.id, f"⏳ {name} вже встановлюється")
+        return
+
+    bot.answer_callback_query(call.id, f"📥 Стартую встановлення {name}")
+    bot.send_message(MY_ID, f"⏳ Почалося встановлення {name}... Зачекайте 1-2 хвилини.",
+                     reply_markup=get_system_menu())
+    threading.Thread(target=install_app_worker, args=(code,), daemon=True).start()
+
+# ==========================================
 # 4. ГОЛОВНИЙ ОБРОБНИК КОМАНД ТА КНОПОК
 # ==========================================
 @bot.message_handler(content_types=['text'])
@@ -596,6 +820,11 @@ def handle_text(message):
     elif msg == "🖥 Дистанційне керування":
         bot.send_message(MY_ID, "🔎 Перевіряю RustDesk / AnyDesk на ПК...")
         threading.Thread(target=remote_desktop_worker, daemon=True).start()
+    elif msg == "📥 Встановити додаток":
+        bot.send_message(MY_ID,
+                         "📥 *Автоматичне встановлення*\n\n"
+                         "Обери програму - я завантажу та встановлю її тихо у фоні:",
+                         parse_mode="Markdown", reply_markup=get_install_menu())
     elif msg == "📝 Процеси":
         procs = sorted(psutil.process_iter(['name', 'memory_percent']), key=lambda x: x.info['memory_percent'], reverse=True)[:5]
         text = "🔝 ТОП-5 процесів:\n" + "\n".join([f"🔸 {p.info['name']} ({round(p.info['memory_percent'],1)}%)" for p in procs])
