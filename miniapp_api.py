@@ -17,6 +17,11 @@
     /api/power            - POST живлення: shutdown / reboot / sleep / lock / cancel
     /api/process/kill     - POST завершення процесу за PID (у два кроки)
     /api/media            - POST гучність, мут, медіа-клавіші
+    /api/files            - список файлів у папці ПК (папка завантажень)
+    /api/files/download   - скачування файлу з ПК на телефон (потоком)
+    /api/files/upload     - POST закидання файлу з телефона на ПК
+    /api/files/delete     - POST видалення файлу з ПК (у два кроки)
+    /api/terminal         - POST команда CMD на ПК (у два кроки)
 
 Критичні дії (живлення, завершення процесу) виконуються у два кроки: спочатку
 сервер видає одноразовий токен підтвердження (живе CONFIRM_TTL секунд і прив'язаний
@@ -57,7 +62,7 @@ try:
 except ImportError:  # psutil є у боті, але модуль має працювати й без нього
     psutil = None  # type: ignore
 
-API_VERSION = "1.1"
+API_VERSION = "1.2"
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8777
 DEFAULT_INIT_DATA_TTL = 24 * 3600      # скільки живе initData з Telegram
@@ -71,6 +76,10 @@ POWER_DELAY_MAX = 300                  # максимальна затримка
 CAMERA_MIN_INTERVAL = 2.0              # пауза між знімками з камери, сек
 CAMERA_QUALITY = 82                    # якість JPEG зі камери
 PROCESS_LIST_LIMIT = 60                # скільки процесів максимум віддаємо
+FILES_LIST_LIMIT = 200                 # скільки файлів максимум у списку
+FILES_UPLOAD_MAX = 25 * 1024 * 1024    # максимальний файл з телефона на ПК
+TERMINAL_TIMEOUT = 20                  # скільки секунд чекаємо на команду, сек
+TERMINAL_OUTPUT_LIMIT = 8000           # скільки символів виводу повертаємо
 
 # Статичні файли Mini App: тільки ці типи віддаємо назовні
 STATIC_EXTENSIONS = {".html", ".css", ".js", ".svg", ".png", ".ico", ".webmanifest"}
@@ -138,7 +147,8 @@ class MiniAppConfig:
                  init_data_ttl: int = DEFAULT_INIT_DATA_TTL,
                  session_ttl: int = DEFAULT_SESSION_TTL,
                  base_dir: Optional[str] = None,
-                 config_path: Optional[str] = None):
+                 config_path: Optional[str] = None,
+                 files_dir: Optional[str] = None):
         self.host = host
         self.port = int(port)
         self.public_url = (public_url or "").strip().rstrip("/")
@@ -148,6 +158,7 @@ class MiniAppConfig:
         self.session_ttl = int(session_ttl)
         self.base_dir = base_dir or os.path.dirname(os.path.abspath(__file__))
         self.config_path = config_path or ""
+        self.files_dir = (files_dir or "").strip()
 
     # --- допоміжні ---
     @property
@@ -166,6 +177,15 @@ class MiniAppConfig:
     def miniapp_dir(self) -> str:
         return os.path.join(self.base_dir, "miniapp")
 
+    @property
+    def files_root(self) -> str:
+        """Корінь розділу «Файли»: папка ПК, якою керує Mini App.
+
+        Порожній files_dir означає папку завантажень користувача Windows.
+        """
+        path = self.files_dir or os.path.join(os.path.expanduser("~"), "Downloads")
+        return os.path.realpath(path)
+
     def to_dict(self) -> Dict[str, Any]:
         return {
             "host": self.host,
@@ -177,6 +197,7 @@ class MiniAppConfig:
             "session_ttl": self.session_ttl,
             "config_path": self.config_path,
             "miniapp_dir": self.miniapp_dir,
+            "files_root": self.files_root,
         }
 
     def __repr__(self) -> str:
@@ -215,9 +236,13 @@ def load_config(bot_dir: Optional[str] = None,
                 "allowed_ids": [int(i) for i in (default_allowed or [])],
                 "init_data_ttl": DEFAULT_INIT_DATA_TTL,
                 "session_ttl": DEFAULT_SESSION_TTL,
+                "files_dir": "",
                 "_comment": ("public_url - публічна HTTPS-адреса Mini App (тунель/домен), "
                              "наприклад https://controlpc.example.com. Без неї Mini App "
                              "відкривається лише локально у браузері ПК."),
+                "_comment_files": ("files_dir - папка ПК, яку показує розділ «Файли». "
+                                   "Порожньо = папка завантажень користувача "
+                                   "(C:\\Users\\<ім'я>\\Downloads)."),
             }
             with open(config_path, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
@@ -255,6 +280,7 @@ def load_config(bot_dir: Optional[str] = None,
                             DEFAULT_INIT_DATA_TTL),
         session_ttl=_pick("session_ttl", "CONTROLPC_MINIAPP_SESSION_TTL", int,
                           DEFAULT_SESSION_TTL),
+        files_dir=str(_pick("files_dir", "CONTROLPC_MINIAPP_FILES_DIR", str, "")),
         base_dir=base_dir,
         config_path=config_path,
     )
@@ -943,6 +969,228 @@ def media_action(action: str, steps: int = 5) -> Dict[str, Any]:
             "text": MEDIA_LABELS.get(action, "Виконано")}
 
 
+# ==========================================
+# ФАЙЛИ ПК (ЕТАП 3.1)
+# ==========================================
+# Mini App працює лише з однією папкою (files_dir, типово «Завантаження»).
+# Назовні віддаємо віртуальні шляхи відносно неї: будь-яка спроба вийти за межі
+# папки (.., абсолютний шлях, симлінк назовні) відхиляється.
+def _files_root(config: MiniAppConfig) -> str:
+    """Реальний корінь розділу «Файли»; створює папку, якщо її ще немає."""
+    root = config.files_root
+    if not os.path.isdir(root):
+        try:
+            os.makedirs(root, exist_ok=True)
+        except OSError as e:
+            raise MiniAppError(f"Папка файлів недоступна: {e}")
+    return root
+
+
+def _files_path(config: MiniAppConfig, relative: str = "") -> str:
+    """Віртуальний шлях Mini App -> реальний шлях усередині кореня."""
+    root = _files_root(config)
+    clean = str(relative or "").replace("\\", "/").strip("/")
+    parts = [part for part in clean.split("/") if part not in ("", ".")]
+    if any(part == ".." for part in parts):
+        raise MiniAppError("Некоректний шлях")
+    target = os.path.realpath(os.path.join(root, *parts)) if parts else root
+    if target != root and not target.startswith(root + os.sep):
+        raise MiniAppError("Шлях поза папкою файлів")
+    return target
+
+
+def _files_relative(config: MiniAppConfig, target: str) -> str:
+    """Реальний шлях -> віртуальний (відносний до кореня, через /)."""
+    try:
+        rel = os.path.relpath(target, _files_root(config)).replace(os.sep, "/")
+    except ValueError:
+        return ""
+    return "" if rel == "." else rel
+
+
+def files_list(config: MiniAppConfig, relative: str = "",
+               limit: int = FILES_LIST_LIMIT) -> Dict[str, Any]:
+    """Список файлів і папок для розділу «Файли»: папки завжди першими."""
+    target = _files_path(config, relative)
+    if not os.path.isdir(target):
+        raise MiniAppError("Папку не знайдено")
+    current = _files_relative(config, target)
+    entries: List[Dict[str, Any]] = []
+    try:
+        with os.scandir(target) as iterator:
+            for entry in iterator:
+                if entry.name.startswith("."):      # приховані файли не показуємо
+                    continue
+                try:
+                    info = entry.stat()
+                    is_dir = entry.is_dir()
+                except OSError:
+                    continue
+                entries.append({
+                    "name": entry.name,
+                    "path": f"{current}/{entry.name}" if current else entry.name,
+                    "is_dir": is_dir,
+                    "size": 0 if is_dir else int(info.st_size),
+                    "modified": int(info.st_mtime),
+                })
+    except OSError as e:
+        raise MiniAppError(f"Не вдалося прочитати папку: {e}")
+
+    entries.sort(key=lambda item: (not item["is_dir"], item["name"].lower()))
+    shown = entries[:max(1, int(limit or FILES_LIST_LIMIT))]
+    return {"ok": True,
+            "root": _files_root(config),
+            "path": current,
+            "parent": current.rsplit("/", 1)[0] if current else "",
+            "entries": shown,
+            "count": len(shown),
+            "total": len(entries)}
+
+
+def files_target(config: MiniAppConfig, relative: str) -> Tuple[str, str]:
+    """Файл для скачування: (реальний шлях, ім'я) після всіх перевірок."""
+    if not str(relative or "").strip():
+        raise MiniAppError("Не вказано файл")
+    target = _files_path(config, relative)
+    if not os.path.isfile(target):
+        raise MiniAppError("Файл не знайдено")
+    return target, os.path.basename(target)
+
+
+def files_delete(config: MiniAppConfig, relative: str) -> Dict[str, Any]:
+    """Видаляє файл або ПОРОЖНЮ папку (непорожню папку не чіпаємо)."""
+    target = _files_path(config, relative)
+    root = _files_root(config)
+    if target == root:
+        return {"ok": False, "error": "Кореневу папку видалити не можна", "reason": "root"}
+    name = os.path.basename(target)
+    try:
+        if os.path.isdir(target):
+            os.rmdir(target)                    # працює лише для порожньої папки
+        else:
+            os.remove(target)
+    except OSError as e:
+        return {"ok": False, "reason": "exec",
+                "error": f"Не вдалося видалити «{name}»: {e}"}
+    log(f"files: видалено {relative}")
+    return {"ok": True, "path": _files_relative(config, os.path.dirname(target)),
+            "text": f"«{name}» видалено"}
+
+
+def files_save(config: MiniAppConfig, relative_dir: str, filename: str,
+               data: bytes) -> Dict[str, Any]:
+    """Зберігає файл з телефона у вказану папку ПК (наявні файли не перезаписує)."""
+    if not data:
+        return {"ok": False, "error": "Порожній файл", "reason": "empty"}
+    if len(data) > FILES_UPLOAD_MAX:
+        return {"ok": False, "reason": "too_large",
+                "error": f"Файл більший за {FILES_UPLOAD_MAX // 1048576} МБ"}
+    name = os.path.basename(str(filename or "").replace("\\", "/")).strip()
+    name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", name)[:120]
+    if name in ("", ".", ".."):
+        return {"ok": False, "error": "Некоректна назва файлу", "reason": "bad_name"}
+    folder = _files_path(config, relative_dir)
+    if not os.path.isdir(folder):
+        return {"ok": False, "error": "Папку не знайдено", "reason": "no_dir"}
+    target = os.path.join(folder, name)
+    base, ext = os.path.splitext(name)
+    index = 1
+    while os.path.exists(target):
+        target = os.path.join(folder, f"{base} ({index}){ext}")
+        index += 1
+    try:
+        with open(target, "wb") as f:
+            f.write(data)
+    except OSError as e:
+        return {"ok": False, "error": f"Не вдалося зберегти файл: {e}", "reason": "exec"}
+    saved = os.path.basename(target)
+    log(f"files: прийнято {saved} ({len(data)} байт)")
+    return {"ok": True, "name": saved, "path": _files_relative(config, folder),
+            "size": len(data), "text": f"«{saved}» збережено на ПК"}
+
+
+# ==========================================
+# ТЕРМІНАЛ ПК (ЕТАП 3.1)
+# ==========================================
+def _decode_console(data: bytes) -> str:
+    """Розшифровує вивід CMD (utf-8 / cp866 / cp1251 - залежно від локалі ПК)."""
+    if not data:
+        return ""
+    for encoding in ("utf-8", "cp866", "cp1251"):
+        try:
+            return data.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return data.decode("utf-8", "replace")
+
+
+def terminal_prepare(command: Any) -> Dict[str, Any]:
+    """Перевіряє команду перед показом вікна підтвердження."""
+    text = str(command or "").strip()
+    if not text:
+        return {"ok": False, "error": "Порожня команда", "reason": "empty"}
+    if len(text) > 500:
+        return {"ok": False, "error": "Команда задовга (максимум 500 символів)",
+                "reason": "too_long"}
+    if not _is_windows():
+        return {"ok": False, "error": "Термінал доступний лише на Windows",
+                "reason": "platform"}
+    return {"ok": True, "command": text,
+            "key": hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]}
+
+
+def _kill_process_tree(pid: int) -> None:
+    """Гасить процес CMD разом із дочірніми: інакше вони тримають пайп виводу."""
+    try:
+        if _is_windows():
+            subprocess.run(f"taskkill /F /T /PID {int(pid)}", shell=True,
+                           capture_output=True,
+                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        else:
+            os.kill(int(pid), 9)
+    except Exception as e:
+        log(f"terminal: не вдалося зупинити процес {pid}: {e}")
+
+
+def terminal_run(command: str, timeout: int = TERMINAL_TIMEOUT) -> Dict[str, Any]:
+    """Виконує команду через CMD і повертає вивід (без винятків назовні)."""
+    text = str(command or "").strip()
+    if not text:
+        return {"ok": False, "error": "Порожня команда", "reason": "empty"}
+    started = _now()
+    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    try:
+        proc = subprocess.Popen(text, shell=True, stdin=subprocess.DEVNULL,
+                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                creationflags=flags)
+    except Exception as e:
+        return {"ok": False, "error": f"Команда не запустилася: {e}", "reason": "exec"}
+
+    try:
+        raw, _ = proc.communicate(timeout=max(5, int(timeout)))
+    except subprocess.TimeoutExpired:
+        # shell=True лишає живим дочірній процес (ping, timeout тощо), тому
+        # вбиваємо все дерево - інакше відповідь прийде після завершення команди.
+        _kill_process_tree(proc.pid)
+        try:
+            proc.communicate(timeout=3)
+        except Exception:
+            pass
+        return {"ok": False, "reason": "timeout",
+                "error": f"Команда не завершилася за {timeout} с і була зупинена"}
+
+    output = _decode_console(raw or b"").strip()
+    truncated = False
+    if len(output) > TERMINAL_OUTPUT_LIMIT:
+        output = output[-TERMINAL_OUTPUT_LIMIT:]     # хвіст важливіший за початок
+        truncated = True
+    log(f"terminal: {text[:80]!r} -> код {proc.returncode}")
+    return {"ok": True, "command": text, "code": proc.returncode,
+            "output": output or "(порожній вивід)", "truncated": truncated,
+            "duration": round(_now() - started, 1),
+            "text": f"Команда виконана (код {proc.returncode})"}
+
+
 def capabilities() -> Dict[str, Any]:
     """Що реально доступне на цьому ПК (Mini App вимикає зайві кнопки)."""
     windows = _is_windows()
@@ -953,8 +1201,14 @@ def capabilities() -> Dict[str, Any]:
         "media": windows,
         "camera": camera_available(),
         "processes": psutil is not None,
+        "files": True,
+        "terminal": windows,
         "power_delay": {"min": POWER_DELAY_MIN, "max": POWER_DELAY_MAX, "default": 15},
-        "limits": {"processes": PROCESS_LIST_LIMIT, "camera_interval": CAMERA_MIN_INTERVAL},
+        "limits": {"processes": PROCESS_LIST_LIMIT,
+                   "camera_interval": CAMERA_MIN_INTERVAL,
+                   "files": FILES_LIST_LIMIT,
+                   "upload_mb": FILES_UPLOAD_MAX // 1048576,
+                   "terminal_timeout": TERMINAL_TIMEOUT},
     }
 
 
@@ -1045,6 +1299,38 @@ class MiniAppHandler(BaseHTTPRequestHandler):
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         self._send(body, status)
 
+    def _send_file(self, target: str, name: str) -> None:
+        """Віддає файл з диска потоком (великі файли не тримаємо в пам'яті)."""
+        try:
+            size = os.path.getsize(target)
+            handle = open(target, "rb")
+        except OSError as e:
+            log(f"download {name}: {e}")
+            self._error(500, "Не вдалося прочитати файл", "read_error")
+            return
+        disposition = "attachment; filename*=UTF-8''" + urllib.parse.quote(name)
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type",
+                             mimetypes.guess_type(target)[0] or "application/octet-stream")
+            self.send_header("Content-Length", str(size))
+            self.send_header("Content-Disposition", disposition)
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.end_headers()
+            if self.command != "HEAD":
+                while True:
+                    chunk = handle.read(64 * 1024)
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        except Exception as e:
+            log(f"download {name}: {e}")
+        finally:
+            handle.close()
+
     def _error(self, status: int, message: str, reason: str = "") -> None:
         self._json({"ok": False, "error": message, "reason": reason}, status)
 
@@ -1070,6 +1356,36 @@ class MiniAppHandler(BaseHTTPRequestHandler):
             self._error(400, "Очікується JSON-об'єкт", "bad_json_type")
             return None
         return data
+
+    def _read_raw(self, limit: int) -> Optional[bytes]:
+        """Читає тіло запиту як є (закидання файлу) з обмеженням розміру."""
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except (TypeError, ValueError):
+            self._error(400, "Некоректний Content-Length", "bad_length")
+            return None
+        if length <= 0:
+            self._error(400, "Порожній запит", "empty_body")
+            return None
+        if length > limit:
+            self.close_connection = True      # тіло не читаємо, з'єднання закриваємо
+            self._error(413, f"Файл завеликий (максимум {limit // 1048576} МБ)",
+                        "too_large")
+            return None
+        chunks: List[bytes] = []
+        remaining = length
+        try:
+            while remaining > 0:
+                chunk = self.rfile.read(min(64 * 1024, remaining))
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                remaining -= len(chunk)
+        except Exception as e:
+            log(f"read body: {e}")
+            self._error(400, "Не вдалося прочитати файл", "read_error")
+            return None
+        return b"".join(chunks)
 
     # --- безпека ---
     def _origin_allowed(self) -> bool:
@@ -1196,6 +1512,41 @@ class MiniAppHandler(BaseHTTPRequestHandler):
                 return
             log(f"camera snapshot {width}x{height}, {len(data)} байт")
             self._send(data, 200, "image/jpeg")
+            return
+
+        if path == "/api/files":
+            if not self._require_session():
+                return
+            query = urllib.parse.parse_qs(parsed.query)
+            relative = (query.get("path") or [""])[0][:400]
+            try:
+                listing = files_list(self.config, relative)
+            except MiniAppError as e:
+                self._error(404, str(e), "files")
+                return
+            except Exception as e:
+                log(f"files list: {e}")
+                self._error(500, "Не вдалося прочитати папку", "files")
+                return
+            self._json(listing)
+            return
+
+        if path == "/api/files/download":
+            query = urllib.parse.parse_qs(parsed.query)
+            user_id = self.sessions.verify(self._session_token())
+            if not user_id:
+                # Скачування йде прямим переходом (системний завантажувач телефона
+                # не дає додати заголовок), тому приймаємо сесію і з параметра t.
+                user_id = self.sessions.verify((query.get("t") or [""])[0])
+            if not user_id:
+                self._error(401, "Потрібна авторизація Mini App", "session")
+                return
+            try:
+                target, name = files_target(self.config, (query.get("path") or [""])[0][:400])
+            except MiniAppError as e:
+                self._error(404, str(e), "files")
+                return
+            self._send_file(target, name)
             return
 
         if path.startswith("/api/"):
@@ -1334,6 +1685,74 @@ class MiniAppHandler(BaseHTTPRequestHandler):
                 return
             result = media_action(str(payload.get("action") or ""), payload.get("steps", 5))
             log(f"media {payload.get('action')} -> {result.get('ok')}")
+            self._json(result, 200 if result.get("ok") else 500)
+            return
+
+        if path == "/api/files/upload":
+            if not self._require_session():
+                return
+            query = urllib.parse.parse_qs(parsed.query)
+            relative_dir = (query.get("path") or [""])[0][:400]
+            name = (query.get("name") or [""])[0][:200]
+            data = self._read_raw(FILES_UPLOAD_MAX)
+            if data is None:
+                return
+            result = files_save(self.config, relative_dir, name, data)
+            self._json(result, 200 if result.get("ok") else 400)
+            return
+
+        if path == "/api/files/delete":
+            user_id = self._require_session()
+            if not user_id:
+                return
+            payload = self._read_json()
+            if payload is None:
+                return
+            relative = str(payload.get("path") or "")[:400]
+            token = str(payload.get("confirm") or "")
+            action = "delete:" + hashlib.sha256(relative.encode("utf-8")).hexdigest()[:16]
+            if not token:
+                name = os.path.basename(relative.replace("\\", "/")) or relative
+                response = {"ok": True, "needs_confirm": True, "path": relative,
+                            "text": f"Видалити «{name}» з ПК? Відновити буде неможливо."}
+                response.update(self.confirms.issue(action, user_id))
+                self._json(response)
+                return
+            if not self.confirms.consume(token, action, user_id):
+                self._error(409, "Підтвердження прострочене — повтори дію", "confirm")
+                return
+            try:
+                result = files_delete(self.config, relative)
+            except MiniAppError as e:
+                self._error(400, str(e), "files")
+                return
+            self._json(result, 200 if result.get("ok") else 400)
+            return
+
+        if path == "/api/terminal":
+            user_id = self._require_session()
+            if not user_id:
+                return
+            payload = self._read_json()
+            if payload is None:
+                return
+            check = terminal_prepare(payload.get("command"))
+            if not check.get("ok"):
+                self._json(check, 400)
+                return
+            command = check["command"]
+            token = str(payload.get("confirm") or "")
+            action = f"terminal:{check['key']}"
+            if not token:
+                response = {"ok": True, "needs_confirm": True, "command": command,
+                            "text": f"Виконати на ПК команду: {command}"}
+                response.update(self.confirms.issue(action, user_id))
+                self._json(response)
+                return
+            if not self.confirms.consume(token, action, user_id):
+                self._error(409, "Підтвердження прострочене — повтори команду", "confirm")
+                return
+            result = terminal_run(command)
             self._json(result, 200 if result.get("ok") else 500)
             return
 

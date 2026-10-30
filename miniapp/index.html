@@ -29,7 +29,7 @@
       </span>
       <span class="brand__text">
         <strong>ControlPC</strong>
-        <span class="brand__version" id="bot-version">v3.4</span>
+        <span class="brand__version" id="bot-version">v3.5</span>
       </span>
     </div>
     <button id="refresh-btn" class="icon-btn" type="button" aria-label="Оновити дані">
@@ -183,12 +183,12 @@
           <span class="nav__label">Медіа</span>
           <span class="nav__hint" id="hint-media">гучність · мут</span>
         </button>
-        <button class="nav__item glass" type="button" data-nav="files" data-nav-label="Файли">
+        <button class="nav__item glass" type="button" data-nav="files" data-pane="files" data-nav-label="Файли">
           <span class="nav__icon nav__icon--violet" aria-hidden="true">
             <svg viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7.4A2.4 2.4 0 0 1 5.4 5h3.3l2 2.4h7.9A2.4 2.4 0 0 1 21 9.8v6.8A2.4 2.4 0 0 1 18.6 19H5.4A2.4 2.4 0 0 1 3 16.6z"></path></svg>
           </span>
           <span class="nav__label">Файли</span>
-          <span class="nav__hint">скоро</span>
+          <span class="nav__hint" id="hint-files">завантаження · обмін</span>
         </button>
         <button class="nav__item glass" type="button" data-nav="apps" data-pane="apps" data-nav-label="Додатки">
           <span class="nav__icon nav__icon--amber" aria-hidden="true">
@@ -204,12 +204,12 @@
           <span class="nav__label">Камера</span>
           <span class="nav__hint" id="hint-camera">знімок</span>
         </button>
-        <button class="nav__item glass" type="button" data-nav="terminal" data-nav-label="Термінал">
+        <button class="nav__item glass" type="button" data-nav="terminal" data-pane="terminal" data-nav-label="Термінал">
           <span class="nav__icon nav__icon--slate" aria-hidden="true">
             <svg viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4.4" width="18" height="15.2" rx="3"></rect><path d="M7.4 9.8l2.6 2.2-2.6 2.2M13 14.2h4"></path></svg>
           </span>
           <span class="nav__label">Термінал</span>
-          <span class="nav__hint">скоро</span>
+          <span class="nav__hint" id="hint-terminal">CMD · з підтвердженням</span>
         </button>
       </div>
     </section>
@@ -373,6 +373,36 @@
             </div>
             <button class="btn btn--primary" id="cam-btn" type="button">Зробити знімок</button>
           </div>
+        </section>
+
+        <!-- ФАЙЛИ -->
+        <section class="pane hidden" id="pane-files" data-pane="files" aria-label="Файли">
+          <div class="pane__toolbar">
+            <button class="icon-btn" id="files-up" type="button" aria-label="Папка вище" disabled>
+              <svg viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M12 19V5.4"></path><path d="M5.6 11.6 12 5.2l6.4 6.4"></path></svg>
+            </button>
+            <span class="files-path" id="files-path">Downloads</span>
+            <button class="icon-btn" id="files-refresh" type="button" aria-label="Оновити список файлів">
+              <svg viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M20 12a8 8 0 1 1-2.6-5.9"></path><path d="M20 4.5V10h-5.5"></path></svg>
+            </button>
+          </div>
+          <p class="pane__note" id="files-note">—</p>
+          <ul class="file-list" id="file-list">
+            <li class="proc-list__empty muted">—</li>
+          </ul>
+          <button class="btn btn--primary" id="files-upload" type="button">Закинути файл на ПК</button>
+          <input class="hidden" id="files-input" type="file" tabindex="-1" aria-hidden="true">
+        </section>
+
+        <!-- ТЕРМІНАЛ -->
+        <section class="pane hidden" id="pane-terminal" data-pane="terminal" aria-label="Термінал">
+          <label class="field" for="term-input">
+            <span class="field__label">Команда CMD на ПК</span>
+            <input class="field__input" id="term-input" type="text" placeholder="ipconfig /all" autocomplete="off" autocapitalize="off" spellcheck="false" enterkeyhint="send">
+          </label>
+          <button class="btn btn--primary" id="term-run" type="button">Виконати</button>
+          <p class="pane__note" id="term-meta">кожна команда підтверджується окремо · до 20 с</p>
+          <pre class="term" id="term-out">Вивід команди з'явиться тут</pre>
         </section>
       </div>
     </div>

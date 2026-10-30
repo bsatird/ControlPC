@@ -32,8 +32,8 @@ time.sleep(15)
 MY_ID = "7678008217" # Твій ID
 PC_NAME = platform.node()
 
-# --- ВЕРСІЯ 3.4 (MINI APP: КЕРУВАННЯ ПК, ПРОЦЕСИ, КАМЕРА, МЕДІА) ---
-BOT_VERSION = "3.4 (Mini App: керування)"
+# --- ВЕРСІЯ 3.5 (MINI APP: КЕРУВАННЯ ПК, ПРОЦЕСИ, КАМЕРА, МЕДІА, ФАЙЛИ, ТЕРМІНАЛ) ---
+BOT_VERSION = "3.5 (Mini App: файли і термінал)"
 
 # Папка бота за дефолтом
 botDir = os.path.join(os.environ.get('LOCALAPPDATA', ''), 'ControlPC')
@@ -56,8 +56,10 @@ bot = telebot.TeleBot(TOKEN)
 # 0. MINI APP (ЕТАП 1) - ПІДГОТОВКА СЕРВЕРНОГО МОДУЛЯ
 # ==========================================
 # Модуль miniapp_api.py та папка miniapp/ лежать поруч із ControlPC.py.
-# Якщо на старому ноутбуці їх ще немає (start_internal.bat качає лише ControlPC.py),
-# бот спробує докачати їх з GitHub, а в разі невдачі просто працюватиме без Mini App.
+# start_internal.bat перекачує лише ControlPC.py, тому про нові версії Mini App
+# бот дізнається з тега у файлі miniapp/app.js ("ControlPC Mini App v3.5"):
+# якщо тег не збігається з MINIAPP_FILES_VERSION або файлів немає - докачує їх.
+# У разі невдачі просто працює без Mini App.
 MINIAPP_RAW_BASE = "https://raw.githubusercontent.com/bsatird/ControlPC/refs/heads/main"
 MINIAPP_REMOTE_FILES = (
     "miniapp_api.py",
@@ -65,40 +67,72 @@ MINIAPP_REMOTE_FILES = (
     "miniapp/style.css",
     "miniapp/app.js",
 )
+MINIAPP_FILES_VERSION = "3.5"     # має збігатися з тегом у miniapp/app.js
+
+
+def _miniapp_local_version(app_dir):
+    """Версія файлів Mini App на диску (з тега у перших рядках miniapp/app.js)."""
+    try:
+        with open(os.path.join(app_dir, "miniapp", "app.js"), "r",
+                  encoding="utf-8", errors="replace") as f:
+            head = f.read(400)
+    except OSError:
+        return ""
+    found = re.search(r"ControlPC Mini App v([0-9.]+)", head)
+    return found.group(1) if found else ""
 
 
 def _miniapp_ensure_files():
-    """Докачує відсутні файли Mini App (безпечно: будь-яка помилка лише в лог)."""
+    """Докачує файли Mini App, якщо їх немає або вони застаріли (помилки лише в лог)."""
     app_dir = os.path.dirname(os.path.abspath(__file__))
+    up_to_date = _miniapp_local_version(app_dir) == MINIAPP_FILES_VERSION
     missing = [name for name in MINIAPP_REMOTE_FILES
                if not os.path.exists(os.path.join(app_dir, name.replace("/", os.sep)))]
-    if not missing:
+    if up_to_date and not missing:
         return True
-    for name in missing:
-        url = f"{MINIAPP_RAW_BASE}/{name}"
+    targets = list(MINIAPP_REMOTE_FILES) if not up_to_date else missing
+    if not up_to_date:
+        print(f"[MiniApp] файли Mini App v{_miniapp_local_version(app_dir) or '?'} "
+              f"-> v{MINIAPP_FILES_VERSION}, оновлюю")
+
+    # Спершу качаємо все в пам'ять: часткове оновлення змішало б версії інтерфейсу.
+    fetched = {}
+    for name in targets:
+        try:
+            with urllib.request.urlopen(f"{MINIAPP_RAW_BASE}/{name}", timeout=15) as response:
+                data = response.read()
+        except Exception as e:
+            print(f"[MiniApp] не вдалося завантажити {name}: {e}")
+            return False
+        if not data:
+            print(f"[MiniApp] порожня відповідь для {name}")
+            return False
+        fetched[name] = data
+
+    for name, data in fetched.items():
         target = os.path.join(app_dir, name.replace("/", os.sep))
         try:
             os.makedirs(os.path.dirname(target), exist_ok=True)
-            with urllib.request.urlopen(url, timeout=15) as response:
-                data = response.read()
-            if not data:
-                continue
             with open(target, "wb") as f:
                 f.write(data)
             print(f"[MiniApp] завантажено {name} ({len(data)} байт)")
-        except Exception as e:
-            print(f"[MiniApp] не вдалося завантажити {name}: {e}")
+        except OSError as e:
+            print(f"[MiniApp] не вдалося зберегти {name}: {e}")
     return all(os.path.exists(os.path.join(app_dir, n.replace("/", os.sep)))
                for n in MINIAPP_REMOTE_FILES)
 
 
 try:
+    _miniapp_ensure_files()
+except Exception as _miniapp_sync_error:
+    print(f"[MiniApp] оновлення файлів пропущено: {_miniapp_sync_error}")
+
+try:
+    import importlib
     import miniapp_api
     MINIAPP_AVAILABLE = True
 except Exception as _miniapp_error:
-    _miniapp_ensure_files()
     try:
-        import importlib
         miniapp_api = importlib.import_module("miniapp_api")
         MINIAPP_AVAILABLE = True
     except Exception as _miniapp_error2:
@@ -1943,6 +1977,10 @@ def _miniapp_panel_text():
         f"ПК: {PC_NAME}",
         f"Локально: {local}",
     ]
+    try:
+        lines.append(f"Папка «Файли»: {miniapp_server.config.files_root}")
+    except Exception:
+        pass
     if webapp:
         lines += ["", f"Публічно: {webapp}",
                   "", "Натисни кнопку нижче, щоб відкрити застосунок у Telegram."]

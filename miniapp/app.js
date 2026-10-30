@@ -1,4 +1,4 @@
-/* ControlPC Mini App — логіка (Етап 2: преміальний дашборд) */
+/* ControlPC Mini App v3.5 — логіка (Етап 3: ПК, файли, термінал) */
 (function () {
   'use strict';
 
@@ -23,6 +23,9 @@
     procList: [],
     procQuery: '',
     procLoadedAt: 0,
+    filesPath: '',
+    filesParent: '',
+    filesBusy: false,
     camUrl: ''
   };
 
@@ -30,8 +33,10 @@
   var PANE_TITLES = {
     power: 'Живлення',
     media: 'Медіа',
+    files: 'Файли на ПК',
     apps: 'Додатки та процеси',
-    camera: 'Камера'
+    camera: 'Камера',
+    terminal: 'Термінал ПК'
   };
 
   var POWER_TITLES = {
@@ -526,6 +531,11 @@
     selectionHaptic();
     if (pane === 'apps') { loadProcesses(state.procList.length > 0); }
     if (pane === 'camera') { checkCameraHint(); }
+    if (pane === 'files') { loadFiles(state.filesPath, false); }
+    if (pane === 'terminal') {
+      var termInput = $('term-input');
+      if (termInput) { termInput.focus(); }
+    }
   }
 
   function closeSheet() {
@@ -582,7 +592,8 @@
 
   function applyCapabilities() {
     var caps = state.capabilities || {};
-    var pairs = [['power', 'power'], ['media', 'media'], ['apps', 'processes'], ['camera', 'camera']];
+    var pairs = [['power', 'power'], ['media', 'media'], ['files', 'files'],
+                 ['apps', 'processes'], ['camera', 'camera'], ['terminal', 'terminal']];
     pairs.forEach(function (pair) {
       var key = pair[0];
       var enabled = caps[pair[1]] !== false;
@@ -824,6 +835,334 @@
     }
   }
 
+  // --- файли на ПК ---
+  function fmtSize(bytes) {
+    var size = Number(bytes) || 0;
+    if (size >= 1073741824) { return (size / 1073741824).toFixed(1) + ' ГБ'; }
+    if (size >= 1048576) { return (size / 1048576).toFixed(1) + ' МБ'; }
+    if (size >= 1024) { return Math.round(size / 1024) + ' КБ'; }
+    return size + ' Б';
+  }
+
+  function fmtFileDate(stamp) {
+    if (!stamp) { return ''; }
+    var date = new Date(Number(stamp) * 1000);
+    if (isNaN(date.getTime())) { return ''; }
+    return pad2(date.getDate()) + '.' + pad2(date.getMonth() + 1) +
+      ' ' + pad2(date.getHours()) + ':' + pad2(date.getMinutes());
+  }
+
+  async function loadFiles(path, silent) {
+    if (state.filesBusy) { return; }
+    state.filesBusy = true;
+    var refreshBtn = $('files-refresh');
+    if (refreshBtn) { refreshBtn.classList.add('is-spinning'); refreshBtn.disabled = true; }
+    if (!silent) { setText('files-note', 'читаю папку…'); }
+    try {
+      var res = await api('/api/files?path=' + encodeURIComponent(path || ''));
+      if (!res.ok || !res.data.ok) {
+        renderFiles([]);
+        setText('files-note', errText(res, 'Список файлів недоступний'));
+        return;
+      }
+      var data = res.data;
+      state.filesPath = data.path || '';
+      state.filesParent = typeof data.parent === 'string' ? data.parent : '';
+      renderFiles(data.entries || []);
+      setText('files-path', state.filesPath ? '/' + state.filesPath : 'Downloads');
+      var total = Number(data.total) || 0;
+      setText('files-note', total
+        ? total + ' об\'єктів · тап по файлу завантажить його на телефон'
+        : 'папка порожня');
+      var upBtn = $('files-up');
+      if (upBtn) { upBtn.disabled = !state.filesPath; }
+    } catch (e) {
+      renderFiles([]);
+      setText('files-note', 'немає зв\'язку з ПК');
+    } finally {
+      state.filesBusy = false;
+      if (refreshBtn) {
+        refreshBtn.classList.remove('is-spinning');
+        refreshBtn.disabled = false;
+      }
+    }
+  }
+
+  function renderFiles(entries) {
+    var holder = $('file-list');
+    if (!holder) { return; }
+    holder.textContent = '';
+    var items = Array.isArray(entries) ? entries : [];
+    if (!items.length) {
+      var empty = document.createElement('li');
+      empty.className = 'proc-list__empty muted';
+      empty.textContent = 'Тут порожньо';
+      holder.appendChild(empty);
+      return;
+    }
+    items.forEach(function (entry) { holder.appendChild(buildFileRow(entry)); });
+  }
+
+  function buildFileRow(entry) {
+    var row = document.createElement('li');
+    row.className = 'file-row';
+
+    var main = document.createElement('button');
+    main.type = 'button';
+    main.className = 'file-row__main';
+
+    var name = document.createElement('span');
+    name.className = 'file-row__name';
+    name.textContent = (entry.name || '?') + (entry.is_dir ? '/' : '');
+
+    var meta = document.createElement('span');
+    meta.className = 'file-row__meta';
+    var parts = [entry.is_dir ? 'папка' : fmtSize(entry.size)];
+    if (entry.modified) { parts.push(fmtFileDate(entry.modified)); }
+    meta.textContent = parts.join(' · ');
+
+    main.appendChild(name);
+    main.appendChild(meta);
+    if (entry.is_dir) {
+      main.addEventListener('click', function () {
+        haptic('light');
+        selectionHaptic();
+        loadFiles(entry.path, false);
+      });
+    } else {
+      main.addEventListener('click', function () { downloadFile(entry); });
+    }
+
+    var remove = document.createElement('button');
+    remove.type = 'button';
+    remove.className = 'proc-row__kill';
+    remove.textContent = '×';
+    remove.setAttribute('aria-label', 'Видалити «' + (entry.name || '') + '»');
+    remove.addEventListener('click', function () { requestFileDelete(entry); });
+
+    row.appendChild(main);
+    row.appendChild(remove);
+    return row;
+  }
+
+  function downloadFile(entry) {
+    if (!entry || entry.is_dir || !state.token) { return; }
+    haptic('light');
+    var url = '/api/files/download?path=' + encodeURIComponent(entry.path) +
+      '&t=' + encodeURIComponent(state.token);
+    setText('files-note', 'передаю «' + entry.name + '» на телефон…');
+    var started = false;
+    if (tg && typeof tg.downloadFile === 'function') {
+      try {
+        tg.downloadFile({ url: window.location.origin + url, file_name: entry.name || 'file' });
+        started = true;
+      } catch (e) { started = false; }
+    }
+    if (!started) {
+      var absolute = window.location.origin + url;
+      if (tg && typeof tg.openLink === 'function') {
+        // Telegram сам відкриє посилання системним браузером, де працює скачування.
+        try { tg.openLink(absolute); started = true; } catch (e) { started = false; }
+      }
+      if (!started) { window.open(url, '_blank'); }
+    }
+    notifyHaptic('success');
+    toast('«' + entry.name + '» завантажується');
+  }
+
+  async function requestFileDelete(entry) {
+    haptic('medium');
+    try {
+      var res = await api('/api/files/delete', { method: 'POST', body: { path: entry.path } });
+      if (!res.ok || !res.data.ok) { failAction(res, 'Не вдалося видалити'); return; }
+      if (!res.data.needs_confirm) {
+        toast(res.data.text || 'Видалено');
+        loadFiles(state.filesPath, true);
+        return;
+      }
+      openConfirm({
+        title: 'Видалити з ПК?',
+        text: res.data.text || ('«' + entry.name + '» буде видалено без можливості відновлення.'),
+        label: 'Видалити',
+        onResolve: function (ok) {
+          if (!ok) { haptic('soft'); return; }
+          executeFileDelete(entry.path, res.data.token);
+        }
+      });
+    } catch (e) {
+      notifyHaptic('error');
+      toast('Немає зв\'язку з ПК');
+    }
+  }
+
+  async function executeFileDelete(path, token) {
+    haptic('heavy');
+    try {
+      var res = await api('/api/files/delete', {
+        method: 'POST',
+        body: { path: path, confirm: token }
+      });
+      if (!res.ok || !res.data.ok) {
+        failAction(res, 'Не вдалося видалити');
+        loadFiles(state.filesPath, true);
+        return;
+      }
+      notifyHaptic('success');
+      toast(res.data.text || 'Видалено');
+      loadFiles(typeof res.data.path === 'string' ? res.data.path : state.filesPath, true);
+    } catch (e) {
+      notifyHaptic('error');
+      toast('Немає зв\'язку з ПК');
+    }
+  }
+
+  // --- закидання файлу на ПК ---
+  function uploadLimitMb() {
+    var limits = (state.capabilities && state.capabilities.limits) || {};
+    return Number(limits.upload_mb) || 25;
+  }
+
+  function pickFileToUpload() {
+    var input = $('files-input');
+    if (!input) { return; }
+    haptic('light');
+    input.value = '';
+    input.click();
+  }
+
+  function readFileBytes(file) {
+    return new Promise(function (resolve, reject) {
+      var reader = new FileReader();
+      reader.onload = function () { resolve(reader.result); };
+      reader.onerror = function () { reject(reader.error || new Error('read error')); };
+      reader.readAsArrayBuffer(file);
+    });
+  }
+
+  async function uploadFile(file) {
+    if (!file) { return; }
+    var limit = uploadLimitMb();
+    if (file.size > limit * 1048576) {
+      notifyHaptic('error');
+      toast('Файл більший за ' + limit + ' МБ');
+      return;
+    }
+    haptic('medium');
+    var button = $('files-upload');
+    if (button) { button.disabled = true; button.textContent = 'Передаю…'; }
+    setText('files-note', 'передаю «' + file.name + '» (' + fmtSize(file.size) + ')…');
+    try {
+      var body = await readFileBytes(file);
+      var headers = {
+        'Content-Type': 'application/octet-stream',
+        'Accept': 'application/json'
+      };
+      if (state.token) { headers['X-MiniApp-Token'] = state.token; }
+      var url = '/api/files/upload?path=' + encodeURIComponent(state.filesPath || '') +
+        '&name=' + encodeURIComponent(file.name || 'file');
+      var res = await fetch(url, {
+        method: 'POST',
+        headers: headers,
+        body: body,
+        cache: 'no-store',
+        credentials: 'same-origin'
+      });
+      var data = {};
+      try { data = await res.json(); } catch (e) { data = {}; }
+      if (!res.ok || !data.ok) {
+        notifyHaptic('error');
+        toast(data.error || ('Не вдалося закинути файл (код ' + res.status + ')'));
+        setText('files-note', data.error || 'файл не передано');
+        return;
+      }
+      notifyHaptic('success');
+      toast(data.text || 'Файл збережено на ПК');
+      loadFiles(state.filesPath, true);
+    } catch (e) {
+      notifyHaptic('error');
+      toast('Не вдалося закинути файл');
+      setText('files-note', 'файл не передано');
+    } finally {
+      if (button) { button.disabled = false; button.textContent = 'Закинути файл на ПК'; }
+    }
+  }
+
+  // --- термінал на ПК ---
+  async function runTerminal() {
+    var input = $('term-input');
+    var command = input ? String(input.value || '').trim() : '';
+    if (!command) {
+      notifyHaptic('warning');
+      toast('Введи команду');
+      if (input) { input.focus(); }
+      return;
+    }
+    haptic('medium');
+    try {
+      var res = await api('/api/terminal', { method: 'POST', body: { command: command } });
+      if (!res.ok || !res.data.ok) { failAction(res, 'Команда не виконалася'); return; }
+      if (!res.data.needs_confirm) { showTerminalResult(res.data); return; }
+      openConfirm({
+        title: 'Виконати на ПК?',
+        text: res.data.text || command,
+        label: 'Виконати',
+        onResolve: function (ok) {
+          if (!ok) { haptic('soft'); return; }
+          executeTerminal(command, res.data.token);
+        }
+      });
+    } catch (e) {
+      notifyHaptic('error');
+      toast('Немає зв\'язку з ПК');
+    }
+  }
+
+  async function executeTerminal(command, token) {
+    haptic('heavy');
+    var button = $('term-run');
+    var output = $('term-out');
+    if (button) { button.disabled = true; button.textContent = 'Виконую…'; }
+    setText('term-meta', 'виконую команду…');
+    if (output) { output.textContent = 'виконую…'; }
+    try {
+      var res = await api('/api/terminal', {
+        method: 'POST',
+        body: { command: command, confirm: token }
+      });
+      if (!res.ok || !res.data.ok) {
+        notifyHaptic('error');
+        toast(errText(res, 'Команда не виконалася'));
+        if (output) { output.textContent = errText(res, 'Команда не виконалася'); }
+        setText('term-meta', 'помилка виконання');
+        return;
+      }
+      showTerminalResult(res.data);
+    } catch (e) {
+      notifyHaptic('error');
+      toast('Немає зв\'язку з ПК');
+      if (output) { output.textContent = 'немає зв\'язку з ПК'; }
+      setText('term-meta', 'помилка виконання');
+    } finally {
+      if (button) { button.disabled = false; button.textContent = 'Виконати'; }
+    }
+  }
+
+  function showTerminalResult(data) {
+    var output = $('term-out');
+    var text = (data && data.output) ? String(data.output) : '(порожній вивід)';
+    if (data && data.truncated) { text += '\n… вивід обрізано'; }
+    if (output) {
+      output.textContent = text;
+      output.scrollTop = 0;
+    }
+    var meta = [];
+    if (isNum(data && data.code)) { meta.push('код ' + data.code); }
+    if (isNum(data && data.duration)) { meta.push(data.duration + ' с'); }
+    setText('term-meta', meta.length ? meta.join(' · ') : 'готово');
+    notifyHaptic('success');
+    toast((data && data.text) || 'Виконано');
+  }
+
   // --- камера ---
   function setCameraBusy(busy) {
     var btn = $('cam-btn');
@@ -1023,6 +1362,47 @@
 
     var camBtn = $('cam-btn');
     if (camBtn) { camBtn.addEventListener('click', takeSnapshot); }
+
+    var filesRefresh = $('files-refresh');
+    if (filesRefresh) {
+      filesRefresh.addEventListener('click', function () {
+        haptic('light');
+        loadFiles(state.filesPath, false);
+      });
+    }
+
+    var filesUp = $('files-up');
+    if (filesUp) {
+      filesUp.addEventListener('click', function () {
+        haptic('soft');
+        loadFiles(state.filesParent, false);
+      });
+    }
+
+    var filesUpload = $('files-upload');
+    if (filesUpload) { filesUpload.addEventListener('click', pickFileToUpload); }
+
+    var filesInput = $('files-input');
+    if (filesInput) {
+      filesInput.addEventListener('change', function () {
+        var file = filesInput.files && filesInput.files[0];
+        filesInput.value = '';
+        uploadFile(file);
+      });
+    }
+
+    var termRun = $('term-run');
+    if (termRun) { termRun.addEventListener('click', runTerminal); }
+
+    var termInput = $('term-input');
+    if (termInput) {
+      termInput.addEventListener('keydown', function (event) {
+        if (event.key === 'Enter') {
+          event.preventDefault();
+          runTerminal();
+        }
+      });
+    }
 
     var check = $('confirm-check');
     if (check) {
