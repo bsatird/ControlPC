@@ -1,0 +1,11 @@
+# Службові файли Python / локальні налаштування Mini App
+__pycache__/
+*.pyc
+*.pyo
+
+# Локальний конфіг Mini App (створюється на кожному ПК автоматично)
+miniapp_config.json
+
+# Тимчасові файли перевірок
+_point*.txt
+_check*.txt

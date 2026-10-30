@@ -13,6 +13,10 @@ $tokenFile = "$botDir\token.txt"
 # ⚠️ ЗАМІНИ ЦЕ ПОСИЛАННЯ НА СВОЄ ПРЯМЕ ПОСИЛАННЯ НА CONTROLPC.PY (З REPOS/GIST)
 $botUrl = "https://raw.githubusercontent.com/bsatird/ControlPC/refs/heads/main/ControlPC.py"
 
+# --- TELEGRAM MINI APP (ЕТАП 1): серверний модуль + інтерфейс ---
+$rawBase = "https://raw.githubusercontent.com/bsatird/ControlPC/refs/heads/main"
+$miniAppFiles = @("miniapp_api.py", "miniapp/index.html", "miniapp/style.css", "miniapp/app.js")
+
 Write-Host "`n--- ПОЧАТОК АВТОМАТИЧНОГО ВСТАНОВЛЕННЯ БОТА ---" -ForegroundColor Magenta
 
 if (!(Test-Path $botDir)) { New-Item -Path $botDir -ItemType Directory | Out-Null }
@@ -41,6 +45,19 @@ Write-Host "[*] Перевірка та встановлення бібліот�
 $packages = "pyTelegramBotAPI", "opencv-python", "pyautogui", "psutil", "pyttsx3", "sounddevice", "scipy", "pyperclip", "pillow"
 foreach ($pkg in $packages) {
     python -m pip install $pkg --quiet
+}
+
+Write-Host "[*] Завантаження файлів Telegram Mini App..." -ForegroundColor Cyan
+foreach ($rel in $miniAppFiles) {
+    $dest = Join-Path $botDir $rel
+    $destDir = Split-Path $dest -Parent
+    if (!(Test-Path $destDir)) { New-Item -Path $destDir -ItemType Directory -Force | Out-Null }
+    try {
+        Invoke-WebRequest -Uri "$rawBase/$rel" -OutFile $dest -UseBasicParsing -ErrorAction Stop
+        Write-Host "    [+] $rel" -ForegroundColor Green
+    } catch {
+        Write-Host "    [!] не вдалося завантажити $rel (бот докачає сам при старті)" -ForegroundColor Yellow
+    }
 }
 
 Write-Host "[*] Створення скриптів прихованого запуску..." -ForegroundColor Cyan

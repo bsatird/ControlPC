@@ -32,8 +32,8 @@ time.sleep(15)
 MY_ID = "7678008217" # Твій ID
 PC_NAME = platform.node()
 
-# --- ВЕРСІЯ 3.1 (ЗАПУЩЕНІ ДОДАТКИ: ПЕРЕГЛЯД ТА КОРЕКТНЕ ЗАКРИТТЯ) ---
-BOT_VERSION = "3.1 (Запущені додатки: перегляд та закриття)"
+# --- ВЕРСІЯ 3.2 (MINI APP: ФУНДАМЕНТ - ВЕБ-СЕРВЕР, АВТОРИЗАЦІЯ, ДАШБОРД) ---
+BOT_VERSION = "3.2 (Mini App: фундамент)"
 
 # Папка бота за дефолтом
 botDir = os.path.join(os.environ.get('LOCALAPPDATA', ''), 'ControlPC')
@@ -53,6 +53,90 @@ except FileNotFoundError:
 bot = telebot.TeleBot(TOKEN)
 
 # ==========================================
+# 0. MINI APP (ЕТАП 1) - ПІДГОТОВКА СЕРВЕРНОГО МОДУЛЯ
+# ==========================================
+# Модуль miniapp_api.py та папка miniapp/ лежать поруч із ControlPC.py.
+# Якщо на старому ноутбуці їх ще немає (start_internal.bat качає лише ControlPC.py),
+# бот спробує докачати їх з GitHub, а в разі невдачі просто працюватиме без Mini App.
+MINIAPP_RAW_BASE = "https://raw.githubusercontent.com/bsatird/ControlPC/refs/heads/main"
+MINIAPP_REMOTE_FILES = (
+    "miniapp_api.py",
+    "miniapp/index.html",
+    "miniapp/style.css",
+    "miniapp/app.js",
+)
+
+
+def _miniapp_ensure_files():
+    """Докачує відсутні файли Mini App (безпечно: будь-яка помилка лише в лог)."""
+    app_dir = os.path.dirname(os.path.abspath(__file__))
+    missing = [name for name in MINIAPP_REMOTE_FILES
+               if not os.path.exists(os.path.join(app_dir, name.replace("/", os.sep)))]
+    if not missing:
+        return True
+    for name in missing:
+        url = f"{MINIAPP_RAW_BASE}/{name}"
+        target = os.path.join(app_dir, name.replace("/", os.sep))
+        try:
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            with urllib.request.urlopen(url, timeout=15) as response:
+                data = response.read()
+            if not data:
+                continue
+            with open(target, "wb") as f:
+                f.write(data)
+            print(f"[MiniApp] завантажено {name} ({len(data)} байт)")
+        except Exception as e:
+            print(f"[MiniApp] не вдалося завантажити {name}: {e}")
+    return all(os.path.exists(os.path.join(app_dir, n.replace("/", os.sep)))
+               for n in MINIAPP_REMOTE_FILES)
+
+
+try:
+    import miniapp_api
+    MINIAPP_AVAILABLE = True
+except Exception as _miniapp_error:
+    _miniapp_ensure_files()
+    try:
+        import importlib
+        miniapp_api = importlib.import_module("miniapp_api")
+        MINIAPP_AVAILABLE = True
+    except Exception as _miniapp_error2:
+        miniapp_api = None
+        MINIAPP_AVAILABLE = False
+        print(f"[MiniApp] модуль недоступний: {_miniapp_error} / {_miniapp_error2}")
+
+miniapp_server = None      # заповнюється нижче, перед запуском polling
+miniapp_started = False    # True лише якщо сервер реально піднявся
+
+
+def _miniapp_webapp_url():
+    """HTTPS-адреса Mini App для WebApp-кнопки (або None, якщо її немає)."""
+    if not MINIAPP_AVAILABLE or not miniapp_started:
+        return None
+    try:
+        return miniapp_api.get_public_url(botDir, os.path.dirname(os.path.abspath(__file__)))
+    except Exception:
+        return None
+
+
+def _miniapp_local_url():
+    """Локальна адреса сервера Mini App (для перевірки з ПК)."""
+    try:
+        if miniapp_server is not None:
+            return miniapp_server.local_url
+    except Exception:
+        pass
+    if MINIAPP_AVAILABLE:
+        try:
+            cfg = miniapp_api.load_config(botDir, os.path.dirname(os.path.abspath(__file__)))
+            return cfg.local_url
+        except Exception:
+            pass
+    return "http://127.0.0.1:8777"
+
+
+# ==========================================
 # 1. МЕНЮ ТА КНОПКИ
 # ==========================================
 def get_main_menu():
@@ -60,6 +144,17 @@ def get_main_menu():
     markup.row("🎮 Медіа", "⚙️ Система")
     markup.row("📂 Файли", "✨ Трішки магії")
     markup.add("👁 Інфо про ПК")
+    # Mini App: за наявності HTTPS-адреси кнопка відкриває застосунок прямо в Telegram,
+    # інакше це звичайна кнопка з інструкцією та локальним посиланням.
+    try:
+        webapp_url = _miniapp_webapp_url()
+        if webapp_url:
+            markup.add(types.KeyboardButton("🖥 Відкрити ControlPC",
+                                            web_app=types.WebAppInfo(url=webapp_url)))
+        else:
+            markup.add("🖥 Відкрити ControlPC")
+    except Exception:
+        markup.add("🖥 Відкрити ControlPC")
     return markup
 
 def get_media_menu():
@@ -1824,6 +1919,65 @@ def handle_apps_callback(call):
         _apps_send(_apps_details_text(app), _apps_app_menu(app))
 
 # ==========================================
+# 3.6 MINI APP: ПАНЕЛЬ ТА ПОСИЛАННЯ
+# ==========================================
+def _miniapp_panel_text():
+    """Текст панелі Mini App для Telegram."""
+    local = _miniapp_local_url()
+    webapp = _miniapp_webapp_url()
+    if not MINIAPP_AVAILABLE:
+        return ("❌ Mini App недоступний: не знайдено файли miniapp_api.py / miniapp/.\n\n"
+                "Запусти run_bot.ps1 ще раз - він докачає їх з GitHub.")
+    if miniapp_server is None or not miniapp_server.running:
+        reason = getattr(miniapp_server, "error", "") if miniapp_server is not None else ""
+        text = "⚠️ Сервер Mini App не запущений.\n"
+        if reason:
+            text += f"Причина: {reason}\n"
+        text += (f"Локальна адреса: {local}\n"
+                 "Перевір miniapp_config.json (порт, enabled) і перезапусти бота.")
+        return text
+
+    lines = [
+        "🖥 ControlPC Mini App",
+        "",
+        f"ПК: {PC_NAME}",
+        f"Локально: {local}",
+    ]
+    if webapp:
+        lines += ["", f"Публічно: {webapp}",
+                  "", "Натисни кнопку нижче, щоб відкрити застосунок у Telegram."]
+    else:
+        lines += [
+            "",
+            "⚠️ Telegram відкриває Mini App лише за HTTPS-адресою.",
+            "Пропиши public_url у miniapp_config.json (адресу тунелю cloudflared/ngrok",
+            "або власного домену) і перезапусти бота - кнопка стане WebApp.",
+            "",
+            f"З цього ПК можна перевірити локально: {local}",
+        ]
+    return "\n".join(lines)
+
+
+def _miniapp_send_panel():
+    """Надсилає панель Mini App з кнопкою відкриття (WebApp або звичайне посилання)."""
+    text = _miniapp_panel_text()
+    markup = None
+    webapp = _miniapp_webapp_url()
+    if webapp:
+        markup = types.InlineKeyboardMarkup()
+        markup.add(types.InlineKeyboardButton("🖥 Відкрити ControlPC",
+                                             web_app=types.WebAppInfo(url=webapp)))
+    elif MINIAPP_AVAILABLE and miniapp_server is not None and miniapp_server.running:
+        markup = types.InlineKeyboardMarkup()
+        markup.add(types.InlineKeyboardButton("🌐 Відкрити локально",
+                                             url=_miniapp_local_url()))
+    try:
+        bot.send_message(MY_ID, text, reply_markup=markup, disable_web_page_preview=True)
+    except Exception as e:
+        bot.send_message(MY_ID, f"❌ Не вдалося надіслати панель Mini App: {e}")
+
+
+# ==========================================
 # 4. ГОЛОВНИЙ ОБРОБНИК КОМАНД ТА КНОПОК
 # ==========================================
 @bot.message_handler(content_types=['text'])
@@ -1846,6 +2000,8 @@ def handle_text(message):
         bot.send_message(MY_ID, "🎭 Меню розіграшів (Твій друг буде в шоці):", reply_markup=get_pranks_menu())
     elif msg == "🔙 Назад до магії":
         bot.send_message(MY_ID, "Повертаюсь до магії:", reply_markup=get_magic_menu())
+    elif msg == "🖥 Відкрити ControlPC":
+        _miniapp_send_panel()
     
     # --- ІНФО ТА МЕДІА ---
     elif msg == "👁 Інфо про ПК":
@@ -1989,6 +2145,35 @@ def handle_text(message):
 # --- ФОНОВИЙ СПОСТЕРІГАЧ ВХІДНИХ ПІДКЛЮЧЕНЬ RUSTDESK ---
 # Стартуємо до polling: якщо на ПК уже висить запит, бот одразу надішле його в Telegram
 threading.Thread(target=_rs_watch_loop, daemon=True).start()
+
+# --- MINI APP: ВЕБ-СЕРВЕР У ФОНОВОМУ ПОТОЦІ (ЕТАП 1) ---
+# Не блокує polling і не ламає бота: у разі будь-якої помилки Mini App просто
+# залишиться недоступним, а всі старі функції працюватимуть як раніше.
+if MINIAPP_AVAILABLE:
+    try:
+        miniapp_server = miniapp_api.start_webapp_server(
+            bot_dir=botDir,
+            bot_token=TOKEN,
+            bot_version=BOT_VERSION,
+            pc_name=PC_NAME,
+            default_allowed=[int(MY_ID)],
+            base_dir=os.path.dirname(os.path.abspath(__file__)),
+            logger=print,
+        )
+        if miniapp_server is not None:
+            miniapp_started = True
+            print(f"[MiniApp] сервер: {miniapp_server.local_url} "
+                  f"(WebApp: {miniapp_server.webapp_url or 'немає HTTPS-адреси'})")
+        else:
+            miniapp_started = False
+            print("[MiniApp] сервер не запущено - бот працює без Mini App")
+    except Exception as _miniapp_start_error:
+        miniapp_server = None
+        miniapp_started = False
+        print(f"[MiniApp] помилка запуску: {_miniapp_start_error}")
+else:
+    print("[MiniApp] модуль miniapp_api недоступний - бот працює без Mini App")
+
 
 if __name__ == "__main__":
     while True:

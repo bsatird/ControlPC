@@ -1,0 +1,114 @@
+<!doctype html>
+<html lang="uk">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+  <meta name="color-scheme" content="dark light">
+  <title>ControlPC</title>
+  <link rel="stylesheet" href="style.css">
+  <script src="https://telegram.org/js/telegram-web-app.js"></script>
+</head>
+<body>
+  <div class="glow glow-a" aria-hidden="true"></div>
+  <div class="glow glow-b" aria-hidden="true"></div>
+
+  <header class="topbar">
+    <div class="topbar__main">
+      <span class="dot" id="conn-dot" title="Стан з'єднання"></span>
+      <div>
+        <h1 id="pc-name">ControlPC</h1>
+        <p id="pc-subtitle" class="muted">підключення…</p>
+      </div>
+    </div>
+    <button id="refresh-btn" class="icon-btn" type="button" aria-label="Оновити дані">⟳</button>
+  </header>
+
+  <!-- Екран завантаження -->
+  <section id="screen-loading" class="screen">
+    <div class="spinner" aria-hidden="true"></div>
+    <p class="muted">Перевіряємо доступ…</p>
+  </section>
+
+  <!-- Екран помилки -->
+  <section id="screen-error" class="screen hidden">
+    <div class="error-icon">🔒</div>
+    <h2 id="error-title">Немає доступу</h2>
+    <p id="error-text" class="muted"></p>
+    <button id="retry-btn" class="btn btn--primary" type="button">Спробувати ще раз</button>
+  </section>
+
+  <!-- Основний екран -->
+  <main id="screen-main" class="screen hidden">
+    <section class="cards">
+      <article class="card">
+        <p class="card__label">Процесор</p>
+        <p class="card__value"><span id="cpu-val">—</span><span class="unit">%</span></p>
+        <div class="bar"><i id="cpu-bar" style="width:0"></i></div>
+        <p class="card__foot" id="cpu-foot">—</p>
+      </article>
+
+      <article class="card">
+        <p class="card__label">Пам'ять</p>
+        <p class="card__value"><span id="ram-val">—</span><span class="unit">%</span></p>
+        <div class="bar"><i id="ram-bar" style="width:0"></i></div>
+        <p class="card__foot" id="ram-foot">—</p>
+      </article>
+
+      <article class="card">
+        <p class="card__label">Диск <span id="disk-drive" class="muted"></span></p>
+        <p class="card__value"><span id="disk-val">—</span><span class="unit">%</span></p>
+        <div class="bar"><i id="disk-bar" style="width:0"></i></div>
+        <p class="card__foot" id="disk-foot">—</p>
+      </article>
+
+      <article class="card">
+        <p class="card__label">Батарея</p>
+        <p class="card__value"><span id="bat-val">—</span><span class="unit">%</span></p>
+        <div class="bar"><i id="bat-bar" style="width:0"></i></div>
+        <p class="card__foot" id="bat-foot">—</p>
+      </article>
+    </section>
+
+    <section class="panel">
+      <div class="panel__head">
+        <h2>Про систему</h2>
+        <span class="muted" id="updated-at">—</span>
+      </div>
+      <ul class="kv">
+        <li><span>ПК</span><b id="info-pc">—</b></li>
+        <li><span>Система</span><b id="info-platform">—</b></li>
+        <li><span>Аптайм</span><b id="info-uptime">—</b></li>
+        <li><span>Версія бота</span><b id="info-bot">—</b></li>
+      </ul>
+    </section>
+
+    <section class="panel">
+      <div class="panel__head">
+        <h2>Найбільші процеси</h2>
+      </div>
+      <ul class="procs" id="proc-list">
+        <li class="muted">—</li>
+      </ul>
+    </section>
+
+    <section class="panel panel--soon">
+      <div class="panel__head">
+        <h2>Керування ПК</h2>
+        <span class="badge">Етап 2</span>
+      </div>
+      <p class="muted">
+        Кнопки живлення, медіа, запущені додатки та файли з'являться тут на наступному етапі.
+        Фундамент Mini App вже працює: сервер, авторизація Telegram і дашборд.
+      </p>
+    </section>
+
+    <footer class="footer">
+      <p class="muted">
+        <span id="foot-user">—</span> · API <span id="foot-api">—</span> · <span id="foot-time">—</span>
+      </p>
+    </footer>
+  </main>
+
+  <script src="app.js"></script>
+</body>
+</html>
