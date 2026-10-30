@@ -32,8 +32,8 @@ time.sleep(15)
 MY_ID = "7678008217" # Твій ID
 PC_NAME = platform.node()
 
-# --- ВЕРСІЯ 3.2 (MINI APP: ФУНДАМЕНТ - ВЕБ-СЕРВЕР, АВТОРИЗАЦІЯ, ДАШБОРД) ---
-BOT_VERSION = "3.2 (Mini App: фундамент)"
+# --- ВЕРСІЯ 3.3 (MINI APP: ПРЕМІАЛЬНИЙ ІНТЕРФЕЙС ТА ДАШБОРД) ---
+BOT_VERSION = "3.3 (Mini App: інтерфейс)"
 
 # Папка бота за дефолтом
 botDir = os.path.join(os.environ.get('LOCALAPPDATA', ''), 'ControlPC')
