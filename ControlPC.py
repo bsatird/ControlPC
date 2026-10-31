@@ -44,8 +44,8 @@ time.sleep(15)
 MY_ID = "7678008217" # Твій ID
 PC_NAME = platform.node()
 
-# --- ВЕРСІЯ 3.5 (MINI APP: КЕРУВАННЯ ПК, ПРОЦЕСИ, КАМЕРА, МЕДІА, ФАЙЛИ, ТЕРМІНАЛ) ---
-BOT_VERSION = "3.5 (Mini App: файли і термінал)"
+# --- ВЕРСІЯ 3.6 (MINI APP: ОБХІД БРАМИ NGROK + UTF-8 ЛОГ) ---
+BOT_VERSION = "3.6 (Mini App: обхід брами ngrok)"
 
 # Папка бота за дефолтом
 botDir = os.path.join(os.environ.get('LOCALAPPDATA', ''), 'ControlPC')
