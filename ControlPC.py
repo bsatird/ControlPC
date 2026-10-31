@@ -27,6 +27,18 @@ import sounddevice as sd
 from scipy.io.wavfile import write
 import pyperclip
 
+# --- КОДУВАННЯ ВИВОДУ ---
+# При прихованому запуску stdout/stderr пишуться у файл у cp1252, і будь-який
+# print() з кирилицею валив бота (UnicodeEncodeError) одразу після старту
+# Mini App. Примусово переводимо потоки в UTF-8, щоб лог не вбивав процес.
+import sys
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+del _stream
+
 time.sleep(15) 
 
 MY_ID = "7678008217" # Твій ID
