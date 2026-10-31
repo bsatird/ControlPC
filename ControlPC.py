@@ -57,7 +57,7 @@ bot = telebot.TeleBot(TOKEN)
 # ==========================================
 # Модуль miniapp_api.py та папка miniapp/ лежать поруч із ControlPC.py.
 # start_internal.bat перекачує лише ControlPC.py, тому про нові версії Mini App
-# бот дізнається з тега у файлі miniapp/app.js ("ControlPC Mini App v3.5"):
+# бот дізнається з тега у файлі miniapp/app.js ("ControlPC Mini App v3.6"):
 # якщо тег не збігається з MINIAPP_FILES_VERSION або файлів немає - докачує їх.
 # У разі невдачі просто працює без Mini App.
 MINIAPP_RAW_BASE = "https://raw.githubusercontent.com/bsatird/ControlPC/refs/heads/main"
@@ -67,7 +67,7 @@ MINIAPP_REMOTE_FILES = (
     "miniapp/style.css",
     "miniapp/app.js",
 )
-MINIAPP_FILES_VERSION = "3.5"     # має збігатися з тегом у miniapp/app.js
+MINIAPP_FILES_VERSION = "3.6"     # має збігатися з тегом у miniapp/app.js
 
 
 def _miniapp_local_version(app_dir):

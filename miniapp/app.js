@@ -1,6 +1,15 @@
-/* ControlPC Mini App v3.5 — логіка (Етап 3: ПК, файли, термінал) */
+/* ControlPC Mini App v3.6 — логіка (Етап 3: ПК, файли, термінал) */
 (function () {
   'use strict';
+
+  // Безкоштовний ngrok перехоплює перший HTML-запит сторінкою ERR_NGROK_6024
+  // («Visit Site»). Її cookie abuse_interstitial живе 7 днів - оновлюємо її на
+  // кожному відкритті, щоб у Telegram WebView брама з'являлась лише раз.
+  (function renewNgrokCookie() {
+    if (!/(^|\.)ngrok(-free)?\.(app|dev|io)$/.test(location.hostname)) return;
+    document.cookie = 'abuse_interstitial=' + location.hostname +
+      ';max-age=604800;path=/;SameSite=None;Secure';
+  })();
 
   var tg = (window.Telegram && window.Telegram.WebApp) ? window.Telegram.WebApp : null;
   var TOKEN_KEY = 'controlpc.miniapp.token';
