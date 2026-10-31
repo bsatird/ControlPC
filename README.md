@@ -17,6 +17,11 @@ several personal laptops, to update itself from `main`, and to keep working when
 | **Access model** | Single owner: Telegram user ID allowlist |
 | **Repository** | <https://github.com/bsatird/ControlPC> |
 
+![ControlPC Mini App dashboard — connection status, uptime, CPU/RAM/disk/battery cards and the control grid](docs/screenshots/miniapp-dashboard.png)
+
+*Telegram Mini App dashboard (Mini App API `1.2`, UI tag `v3.6`): live status cards and the control grid.
+Hostname redacted.*
+
 ---
 
 ## Table of contents
@@ -86,6 +91,10 @@ ControlPC turns a personal Windows machine into a Telegram-controlled endpoint:
 | Camera | JPEG snapshot with rate limiting (≥ 2 s between shots) |
 | Files | Browse a single PC folder, download to phone, upload from phone (≤ 25 MB), delete (two-step) |
 | Terminal | Run a CMD command with an explicit confirmation step and output capture (20 s timeout) |
+
+The **Dashboard** screen is the screenshot at the top of this document: connection state, uptime,
+CPU / RAM / disk / battery cards (each opens a detail view) and the control grid for power, media, files,
+processes, camera and terminal.
 
 ---
 
@@ -161,6 +170,7 @@ ControlPC/
 │   └── app.js              # UI logic: auth, dashboard, files, terminal, camera
 ├── installer.py            # Universal Windows installer (idempotent, stdlib only)
 ├── run_bot.ps1             # Legacy one-shot bootstrap: deps + autostart + first run
+├── docs/screenshots/       # README images (hostname redacted)
 ├── .clinerules             # Project rules for AI-assisted development
 └── .gitignore              # Excludes __pycache__, build artefacts, local config, token.txt
 ```
