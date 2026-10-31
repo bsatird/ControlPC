@@ -80,6 +80,19 @@ ControlPC turns a personal Windows machine into a Telegram-controlled endpoint:
 | Pranks | Matrix effect, SAPI voice line, fake self-destruct (reversible), rickroll |
 | Lifecycle | Restart bot → re-download from GitHub; `/start`; ping/version check |
 
+![ControlPC bot chat — status messages, the Mini App card and the reply keyboard](docs/screenshots/bot-menu.png)
+
+*Bot chat and its persistent reply keyboard: “Медіа” (Media), “Система” (System), “Файли” (Files),
+“Трішки магії” (Pranks), “Інфо про ПК” (PC info), “Відкрити ControlPC” (Open ControlPC) — the last one is
+an inline button that opens the Mini App inside Telegram. The UI language is Ukrainian; the PC name, the
+Windows user folder and the public tunnel domain are redacted.*
+
+![RustDesk guard — an incoming RustDesk session is accepted or declined from Telegram](docs/screenshots/rustdesk-guard.png)
+
+*RustDesk guard: the bot notices an incoming connection prompt on the PC and mirrors it into Telegram with
+`approve-mode` and the session ID, so the owner answers remotely — “Прийняти” (Accept) or “Відхилити”
+(Decline) — instead of walking to the machine. The RustDesk ID is redacted.*
+
 ### 2.2 Telegram Mini App (`miniapp_api.py` + `miniapp/`)
 
 | Screen | Capabilities |
@@ -170,7 +183,7 @@ ControlPC/
 │   └── app.js              # UI logic: auth, dashboard, files, terminal, camera
 ├── installer.py            # Universal Windows installer (idempotent, stdlib only)
 ├── run_bot.ps1             # Legacy one-shot bootstrap: deps + autostart + first run
-├── docs/screenshots/       # README images (hostname redacted)
+├── docs/screenshots/       # README images (sensitive values redacted)
 ├── .clinerules             # Project rules for AI-assisted development
 └── .gitignore              # Excludes __pycache__, build artefacts, local config, token.txt
 ```
