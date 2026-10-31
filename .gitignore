@@ -9,3 +9,9 @@ miniapp_config.json
 # Тимчасові файли перевірок
 _point*.txt
 _check*.txt
+
+# Артефакти збірки installer.exe (PyInstaller)
+build/
+dist/
+*.spec
+
