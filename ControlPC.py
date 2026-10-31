@@ -44,8 +44,8 @@ time.sleep(15)
 MY_ID = "7678008217" # Твій ID
 PC_NAME = platform.node()
 
-# --- ВЕРСІЯ 3.6 (MINI APP: ОБХІД БРАМИ NGROK + UTF-8 ЛОГ) ---
-BOT_VERSION = "3.6 (Mini App: обхід брами ngrok)"
+# --- ВЕРСІЯ 3.7 (БЕЗПЕКА: /CMD І ФАЙЛИ ЛИШЕ ДЛЯ ВЛАСНИКА) ---
+BOT_VERSION = "3.7 (безпека: /cmd і файли лише для власника)"
 
 # Папка бота за дефолтом
 botDir = os.path.join(os.environ.get('LOCALAPPDATA', ''), 'ControlPC')
@@ -270,6 +270,9 @@ except:
 # --- КОМАНДА CMD ---
 @bot.message_handler(commands=['cmd'])
 def run_command(message):
+    # Виконує довільні команди на ПК, тому приймаємо їх лише від власника.
+    if str(message.chat.id) != str(MY_ID):
+        return
     cmd_text = message.text.replace('/cmd ', '')
     if cmd_text == '/cmd' or not cmd_text:
         bot.reply_to(message, "Приклад: /cmd dir")
@@ -288,12 +291,19 @@ def run_command(message):
 # --- ДЕФОЛТНИЙ ПРИЙОМ ФАЙЛІВ ---
 @bot.message_handler(content_types=['document', 'photo'])
 def handle_upload(message):
+    # Файли з Telegram пишуться на диск ПК, тому приймаємо їх лише від власника.
+    if str(message.chat.id) != str(MY_ID):
+        return
     try:
         upload_path = os.path.join(botDir, "Downloads")
         if not os.path.exists(upload_path): os.makedirs(upload_path)
         file_info = bot.get_file(message.document.file_id if message.document else message.photo[-1].file_id)
         downloaded_file = bot.download_file(file_info.file_path)
         file_name = message.document.file_name if message.document else f"photo_{int(time.time())}.jpg"
+        # Ім'я від Telegram може містити шлях ("..\\..\\file") - лишаємо тільки назву.
+        file_name = os.path.basename(str(file_name or "").replace("\\", "/")).strip()
+        if not file_name:
+            file_name = f"file_{int(time.time())}.bin"
         src = os.path.join(upload_path, file_name)
         with open(src, 'wb') as new_file:
             new_file.write(downloaded_file)
@@ -376,6 +386,10 @@ def process_upload_file(message, target_path):
         file_info = bot.get_file(message.document.file_id if message.document else message.photo[-1].file_id)
         downloaded_file = bot.download_file(file_info.file_path)
         file_name = message.document.file_name if message.document else f"photo_{int(time.time())}.jpg"
+        # Ім'я від Telegram може містити шлях ("..\\..\\file") - лишаємо тільки назву.
+        file_name = os.path.basename(str(file_name or "").replace("\\", "/")).strip()
+        if not file_name:
+            file_name = f"file_{int(time.time())}.bin"
         src = os.path.join(target_path, file_name)
         with open(src, 'wb') as new_file:
             new_file.write(downloaded_file)
