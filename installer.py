@@ -70,7 +70,8 @@ BOT_TOKEN_RE = re.compile(r"^\d{5,12}:[A-Za-z0-9_-]{25,}$")
 # authtoken ngrok: довгий рядок із латинських літер, цифр, '_' та '-'.
 NGROK_TOKEN_RE = re.compile(r"^[A-Za-z0-9_\-]{30,}$")
 # Імена файлів/ярликів старих інсталяцій: другий автозапуск підняв би другого бота.
-AUTOSTART_MARKERS = ("controlpc", "start_background", "start_hidden", "start_internal")
+AUTOSTART_MARKERS = ("controlpc", "start_background", "start_hidden", "start_internal",
+                     "silent_start")
 
 
 class InstallerError(RuntimeError):
@@ -913,6 +914,52 @@ def find_conflicting_tasks(hidden_vbs: Path) -> List[Tuple[str, str]]:
     return conflicts
 
 
+def _autostart_marker_in_data(path: Path) -> bool:
+    """Чи згадує файл (ярлик/скрипт) наші маркери - в імені або всередині."""
+    if any(marker in path.name.lower() for marker in AUTOSTART_MARKERS):
+        return True
+    try:
+        data = path.read_bytes()[:64 * 1024].lower()      # нижній регістр лише для ASCII
+    except OSError:
+        return False
+    for marker in AUTOSTART_MARKERS:
+        if marker.encode("ascii") in data or marker.encode("utf-16-le") in data:
+            return True
+    return False
+
+
+def find_conflicting_startup(startup: Optional[Path]) -> List[Path]:
+    """Ярлики/скрипти старих інсталяцій у папці «Автозавантаження»."""
+    if startup is None:
+        return []
+    try:
+        entries = sorted(startup.iterdir())
+    except OSError:
+        return []
+    conflicts: List[Path] = []
+    for entry in entries:
+        if not entry.is_file() or entry.name.lower().endswith(".bak"):
+            continue                     # уже вимкнені старі автозапуски
+        if entry.name.lower() == STARTUP_LAUNCHER.lower():
+            continue                     # наш власний ярлик не чіпаємо
+        if _autostart_marker_in_data(entry):
+            conflicts.append(entry)
+    return conflicts
+
+
+def disable_startup_entry(path: Path) -> bool:
+    """Ховає старий автозапуск: перейменовує у «*.bak», щоб Windows його не запускав."""
+    target = path.with_name(path.name + ".bak")
+    try:
+        if target.exists():
+            target.unlink()
+        path.rename(target)
+    except OSError as exc:
+        warn(f"{path.name} не прибрано: {exc}")
+        return False
+    return True
+
+
 def ensure_scheduled_task(hidden_vbs: Path) -> bool:
     """Створює (або перестворює) завдання ControlPC_Bot з прихованим запуском."""
     trigger = f'wscript.exe "{hidden_vbs}"'
@@ -1128,6 +1175,10 @@ def main() -> int:
         problems.append("start_hidden.vbs не створено - фоновий запуск недоступний")
     else:
         ok("start_hidden.vbs: прихований запуск ngrok + цикл оновлення бота")
+    if (work_dir / "start_internal.bat").exists():
+        say("    старий лончер start_internal.bat більше не використовується.")
+        say("    Якщо бот уже працював - закрий старий процес або перезавантаж ПК,")
+        say("    інакше два екземпляри бота конфліктуватимуть у Telegram.")
 
     if hidden_vbs is not None and has_token:
         for name, command in find_conflicting_tasks(hidden_vbs):
@@ -1137,6 +1188,11 @@ def main() -> int:
                     ok(f"завдання {name} видалено")
                 else:
                     warn(f"{name} не видалено (потрібні права адміністратора)")
+        for entry in find_conflicting_startup(startup):
+            warn(f"старий автозапуск: {entry.name}")
+            if ask_yes_no(f"Прибрати {entry.name} з Автозавантаження?", default=False):
+                if disable_startup_entry(entry):
+                    ok(f"{entry.name} -> {entry.name}.bak")
         if startup is not None:
             launcher = write_startup_launcher(startup, hidden_vbs)
             if launcher is not None:
